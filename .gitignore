@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+.npm-cache/
+
+# 本地持仓数据 —— 属于个人数据，不要上传
+data/
+
+# 开发期截图与无头浏览器 profile
+.shots/
+
+# 日志
+*.log

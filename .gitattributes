@@ -1,0 +1,12 @@
+# 默认按文本处理，并在仓库里统一为 LF —— 避免不同人的 core.autocrlf 设置造成换行符噪音
+* text=auto
+
+# 明确二进制文件，避免 Git 误判为文本而做换行转换
+*.exe   binary
+*.ico   binary
+*.png   binary
+*.woff2 binary
+
+# .bat 交给 cmd.exe 执行，工作区必须是 CRLF（仓库内仍存 LF）
+*.bat   text eol=crlf
+*.cmd   text eol=crlf

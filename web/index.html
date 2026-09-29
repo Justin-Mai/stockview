@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>股票账本 · Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="./styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='3' fill='%23e8452c'/><text x='16' y='23' font-size='19' text-anchor='middle' fill='%23fff' font-family='serif'>%E8%B4%A6</text></svg>" />
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+<div class="shell">
+
+  <aside class="rail">
+    <div class="brand">
+      <div class="seal">账</div>
+      <div class="brand-text">
+        <b>股票账本</b>
+        <span>LEDGER · 本机版</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item" data-tab="overview">
+        <i>一</i><b>总览</b><span>Overview</span>
+      </button>
+      <button class="nav-item" data-tab="stock">
+        <i>二</i><b>股票</b><span>Stocks</span>
+      </button>
+      <button class="nav-item" data-tab="fund">
+        <i>三</i><b>基金</b><span>Funds</span>
+      </button>
+      <button class="nav-item" data-tab="crypto">
+        <i>四</i><b>加密货币</b><span>Crypto</span>
+      </button>
+      <button class="nav-item" data-tab="settings">
+        <i>五</i><b>设置</b><span>Settings</span>
+      </button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="kv"><span>行情时间</span><b id="quoteAt">—</b></div>
+      <div class="kv"><span>USD / CNY</span><b id="usdCny">—</b></div>
+      <div class="kv"><span>今日</span><b id="todayStr">—</b></div>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <header class="stage-head">
+      <div class="head-left">
+        <p class="eyebrow" id="eyebrow">资金总账</p>
+        <h1 class="title" id="viewTitle"><span>总览</span><em>Overview</em></h1>
+      </div>
+      <div class="head-right">
+        <div class="update-info" id="updateInfo"></div>
+        <button class="btn-seal" id="btnUpdate">
+          <span class="btn-label">更新行情</span>
+          <span class="btn-spin" aria-hidden="true"></span>
+        </button>
+      </div>
+    </header>
+
+    <div class="view" id="view-overview"></div>
+    <div class="view" id="view-stock" hidden></div>
+    <div class="view" id="view-fund" hidden></div>
+    <div class="view" id="view-crypto" hidden></div>
+    <div class="view" id="view-settings" hidden></div>
+  </main>
+</div>
+
+<div class="busy" id="busy" hidden>
+  <div class="busy-card">
+    <div class="busy-seal"><span>账</span></div>
+    <b id="busyTitle">处理中…</b>
+    <p id="busyLabel">请稍候</p>
+    <div class="busy-bar"><i id="busyFill"></i></div>
+    <small id="busyMeta"></small>
+  </div>
+</div>
+
+<div class="backdrop" id="backdrop" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-modal="true" role="dialog">
+  <div class="drawer-edge" aria-hidden="true"></div>
+  <header class="drawer-head">
+    <div>
+      <p class="eyebrow" id="drawerKind">新增</p>
+      <h2 class="drawer-title" id="drawerTitle">股票</h2>
+    </div>
+    <button class="x" id="drawerClose" aria-label="关闭">×</button>
+  </header>
+  <form class="drawer-body" id="drawerForm" autocomplete="off"></form>
+  <footer class="drawer-foot">
+    <button class="linky danger" id="drawerDelete" hidden>删除这条记录</button>
+    <div class="foot-btns">
+      <button class="btn-ghost" id="drawerCancel">取消</button>
+      <button class="btn-seal" id="drawerSubmit" form="drawerForm" type="submit">保存</button>
+    </div>
+  </footer>
+</aside>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

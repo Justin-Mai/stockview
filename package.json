@@ -1,0 +1,42 @@
+{
+  "name": "stockview",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "双击即用的本地股票 / 基金 / 加密货币资产统计面板，自带按交易日结算的日定投引擎",
+  "keywords": [
+    "stock",
+    "fund",
+    "crypto",
+    "portfolio",
+    "a-share",
+    "定投",
+    "记账",
+    "stock-sdk"
+  ],
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Justin-Mai/stockview.git"
+  },
+  "homepage": "https://github.com/Justin-Mai/stockview#readme",
+  "bugs": {
+    "url": "https://github.com/Justin-Mai/stockview/issues"
+  },
+  "scripts": {
+    "start": "node server/index.js --open",
+    "serve": "node server/index.js",
+    "icon": "pwsh -NoProfile -File scripts/make-icon.ps1",
+    "launcher": "pwsh -NoProfile -File scripts/build-launcher.ps1",
+    "seed": "node scripts/seed-demo.mjs",
+    "selftest": "node scripts/selftest.mjs",
+    "uicheck": "node scripts/uicheck.mjs",
+    "contrast": "node scripts/contrast-check.mjs --hc"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "stock-sdk": "^2.4.4"
+  }
+}
