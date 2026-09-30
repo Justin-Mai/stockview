@@ -353,7 +353,15 @@ tbody tr.flash-down { animation: flashDown 1.4s var(--ease); }
 @keyframes flashDown { 0%, 100% { background: transparent; } 22% { background: rgba(56, 166, 123, .18); } }
 
 .who { display: flex; flex-direction: column; gap: 2px; }
+.who-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .who b { font-family: var(--font-ui); font-size: 14.5px; font-weight: 600; color: var(--paper); letter-spacing: .02em; }
+/* 账户 / 备注徽标：同一个代码有多条记录时，这是唯一能区分它们的信息，所以给它一点存在感 */
+.who .acct, .legend-item .acct {
+  font-family: var(--font-mono); font-style: normal; font-size: 10.5px;
+  letter-spacing: .04em; color: var(--gold);
+  border: 1px solid rgba(216, 173, 51, .42); background: rgba(216, 173, 51, .1);
+  border-radius: 1px; padding: 1px 6px; white-space: nowrap;
+}
 .who span { font-family: var(--font-mono); font-size: 11px; color: var(--paper-3); letter-spacing: .04em; }
 .who .flag { color: var(--gold); }
 .who .sub { font-family: var(--font-mono); font-size: 11px; color: var(--paper-3); }
@@ -377,6 +385,38 @@ tbody tr.flash-down { animation: flashDown 1.4s var(--ease); }
 
 .row-actions { display: flex; gap: 12px; justify-content: flex-end; opacity: 0; transition: opacity .25s; }
 tbody tr:hover .row-actions { opacity: 1; }
+
+/* ------------------------------------------------------------ 排序与拖动 */
+
+.head-tools { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+
+.sort-bar { display: flex; align-items: center; gap: 2px; }
+.sort-label { font-size: 11px; letter-spacing: .06em; color: var(--paper-3); margin-right: 6px; }
+.sort-btn {
+  cursor: pointer; background: none; border: 1px solid transparent; border-radius: 2px;
+  padding: 5px 9px; font-family: var(--font-ui); font-size: 11.5px;
+  color: var(--paper-3); transition: color .2s, border-color .2s, background .2s;
+}
+.sort-btn:hover { color: var(--paper-2); border-color: var(--line); }
+.sort-btn.on { color: var(--seal-2); border-color: rgba(255, 114, 85, .42); background: rgba(232, 69, 44, .1); }
+
+/* 拖动把手列 */
+.drag-col { width: 22px; padding-left: 4px !important; padding-right: 0 !important; }
+.grip {
+  display: inline-block; cursor: grab; user-select: none;
+  font-size: 13px; line-height: 1; color: var(--paper-4);
+  /* 默认淡显而不是完全隐藏：否则用户不知道这里能拖 */
+  opacity: .28; transition: opacity .2s, color .2s;
+}
+tbody tr:hover .grip { opacity: 1; }
+tbody tr:hover .grip:hover { color: var(--seal-2); }
+/* 排序视图下不可拖动：把手变暗并提示 */
+.table-wrap.sorted .grip { cursor: not-allowed; opacity: .14 !important; }
+.table-wrap.sorted tbody tr:hover .grip { opacity: .22 !important; }
+
+tbody tr.dragging { background: rgba(232, 69, 44, .12); }
+tbody tr.dragging td { border-bottom-color: transparent; }
+tbody tr[draggable="true"] { cursor: default; }
 
 .empty {
   padding: 76px 22px; text-align: center;

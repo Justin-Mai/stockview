@@ -27,6 +27,23 @@ const fmt = {
     const s = v.toLocaleString('zh-CN', nf(Math.abs(v) < 1 ? 4 : 2));
     return s;
   },
+  /**
+   * 基金成本 / 持仓均价：最多 6 位小数，去掉多余尾零。
+   * 服务端 decorate 里就是 round(avgCost, 6)，通用 price() 对 ≥1 的数只给 3 位，会看不出精度。
+   */
+  cost(n) {
+    if (n === null || n === undefined || !Number.isFinite(Number(n))) return '—';
+    return Number(n).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 6 });
+  },
+  /**
+   * 加密货币数量：最多 15 位小数，去掉多余尾零。
+   * 币的数量常常很小（0.008090321234567 BTC），通用的 qty() 只给 4 位会把精度截掉；
+   * 也不能全局放开位数 —— 否则股票 100 股会显示成 100.0000000000。
+   */
+  cryptoQty(n) {
+    if (n === null || n === undefined || !Number.isFinite(Number(n))) return '—';
+    return Number(n).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 15 });
+  },
   price(n, dp = 4) {
     if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
     const v = Number(n);
@@ -42,6 +59,13 @@ const fmt = {
     if (n === null || n === undefined) return '—';
     const v = Number(n);
     return `${v > 0 ? '+' : ''}${v.toLocaleString('zh-CN', nf(dp))}`;
+  },
+  /** 带符号与货币符号：+$64.98 / -¥1,234.00 */
+  signedMoney(n, symbol, dp = 2) {
+    if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
+    const v = Number(n);
+    const sign = v > 0 ? '+' : v < 0 ? '-' : '';
+    return `${sign}${symbol}${Math.abs(v).toLocaleString('zh-CN', nf(dp))}`;
   },
   cls(n) {
     const v = Number(n);
@@ -92,6 +116,60 @@ async function api(path, { method = 'GET', body } = {}) {
 let S = null; // 服务端快照
 let tab = 'overview';
 const flashQueue = new Map(); // id -> { dir, at }
+
+/* ------------------------------------------------------------ 排序状态 */
+
+/** manual = 自定义（可拖动排序），其余按字段排序 */
+const SORT_FIELDS = {
+  manual: { label: '自定义', key: null, hint: '按你拖动的顺序排列' },
+  marketValue: { label: '市值', key: 'marketValue', hint: '按市值排序（点击切换升降序）' },
+  pnl: { label: '盈亏额', key: 'pnl', hint: '按盈亏金额排序（点击切换升降序）' },
+  pnlPct: { label: '盈亏率', key: 'pnlPct', hint: '按收益率排序（点击切换升降序）' },
+};
+const SORT_STORE_KEY = 'stockview.sort';
+const sortState = {
+  stock: { by: 'manual', desc: true },
+  fund: { by: 'manual', desc: true },
+  crypto: { by: 'manual', desc: true },
+};
+
+function loadSortState() {
+  try {
+    const raw = localStorage.getItem(SORT_STORE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    for (const scope of Object.keys(sortState)) {
+      if (saved?.[scope] && SORT_FIELDS[saved[scope].by]) {
+        sortState[scope] = { by: saved[scope].by, desc: saved[scope].desc !== false };
+      }
+    }
+  } catch {
+    /* 忽略损坏的本地设置 */
+  }
+}
+
+function saveSortState() {
+  try {
+    localStorage.setItem(SORT_STORE_KEY, JSON.stringify(sortState));
+  } catch {
+    /* 隐私模式忽略 */
+  }
+}
+
+function sortRows(scope, rows) {
+  const s = sortState[scope];
+  const field = s && SORT_FIELDS[s.by]?.key;
+  if (!field) return rows;
+  return [...rows].sort((a, b) => {
+    const va = Number(a[field]) || 0;
+    const vb = Number(b[field]) || 0;
+    return s.desc ? vb - va : va - vb;
+  });
+}
+
+function rowsOfScope(scope) {
+  return scope === 'stock' ? S.stocks : scope === 'fund' ? S.funds : S.crypto;
+}
 
 /* ------------------------------------------------------------ 高对比度 */
 
@@ -265,8 +343,10 @@ function renderOverview() {
         .map((a, i) => {
           const color = PALETTE[i % PALETTE.length];
           const w = Math.max(a.weight, 1.2);
-          return `<div class="ribbon-seg" style="flex:${w} 1 0;background:${color}" title="${esc(a.name)} ${fmt.money(a.value)} · ${a.weight}%">
-            ${w > 7 ? `<em>${esc(a.code || a.name).slice(0, 10)} ${a.weight.toFixed(1)}%</em>` : ''}
+          // 同代码多条时用「代码 · 账户」区分，否则两段标签一模一样
+          const label = a.note ? `${a.code}·${a.note}` : a.code || a.name;
+          return `<div class="ribbon-seg" style="flex:${w} 1 0;background:${color}" title="${esc(a.name)}${a.note ? `（${esc(a.note)}）` : ''} ${fmt.money(a.value)} · ${a.weight}%">
+            ${w > 7 ? `<em>${esc(label).slice(0, 12)} ${a.weight.toFixed(1)}%</em>` : ''}
           </div>`;
         })
         .join('')
@@ -276,7 +356,7 @@ function renderOverview() {
     .slice(0, 10)
     .map((a, i) => {
       const color = PALETTE[i % PALETTE.length];
-      return `<div class="legend-item"><i class="legend-dot" style="background:${color}"></i>${esc(a.name)} <b>${fmt.money(a.value)}</b> · ${a.weight}%</div>`;
+      return `<div class="legend-item"><i class="legend-dot" style="background:${color}"></i>${esc(a.name)}${a.note ? ` <em class="acct">${esc(a.note)}</em>` : ''} <b>${fmt.money(a.value)}</b> · ${a.weight}%</div>`;
     })
     .join('');
 
@@ -285,12 +365,23 @@ function renderOverview() {
     const b = c.byScope[key];
     const list = key === 'stock' ? S.stocks : key === 'fund' ? S.funds : S.crypto;
     const pending = key === 'fund' ? c.dca.pendingDays : 0;
+    // 盈亏一律带货币符号：股票/基金用 ¥；加密货币把人民币金额紧跟「盈亏」，美元金额排在其后
+    const pnlMain =
+      key === 'crypto'
+        ? `${fmt.signedMoney(b.pnl, '¥')} ${fmt.signedMoney(b.pnlNative, '$')}`
+        : fmt.signedMoney(b.pnl, '¥');
+    const pnlNote =
+      key === 'fund'
+        ? pending > 0
+          ? `<b class="warn" style="color:var(--gold)">待定投 ${pending} 日</b>`
+          : '定投已同步'
+        : `成本 <b>${fmt.num(b.cost, 0)}</b>`;
     return `<div class="card" data-goto="${key}">
       <div class="card-head"><b>${meta.title}</b><em>${list.length} 项 · ${t.marketValue > 0 ? ((b.marketValue / t.marketValue) * 100).toFixed(1) : '0.0'}%</em></div>
       <div class="card-value">${fmt.money(b.marketValue)}</div>
       <div class="card-foot">
-        <span>盈亏 <b class="${fmt.cls(b.pnl)}">${fmt.signed(b.pnl)}</b> · <b class="${fmt.cls(b.pnl)}">${fmt.pct(b.pnlPct)}</b></span>
-        <span>${key === 'fund' ? (pending > 0 ? `<b class="warn" style="color:var(--gold)">待定投 ${pending} 日</b>` : '定投已同步') : `成本 <b>${fmt.num(b.cost, 0)}</b>`}</span>
+        <span>盈亏 <b class="${fmt.cls(b.pnl)}">${pnlMain}</b> · <b class="${fmt.cls(b.pnl)}">${fmt.pct(b.pnlPct)}</b></span>
+        <span>${pnlNote}</span>
       </div>
     </div>`;
   };
@@ -357,24 +448,43 @@ function renderOverview() {
 
 const COLUMNS = {
   stock: [
+    { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
     { k: '持股' }, { k: '成本价' }, { k: '现价' }, { k: '今日涨跌' },
     { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '自上次更新' },
     { k: '走势' }, { k: '操作', cls: 'l' },
   ],
   fund: [
+    { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
     { k: '持有份额' }, { k: '持仓均价' }, { k: '单位净值' }, { k: '日涨跌' },
     { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '日定投' }, { k: '已定投' },
     { k: '自上次更新' }, { k: '走势' }, { k: '操作', cls: 'l' },
   ],
   crypto: [
+    { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
     { k: '数量' }, { k: '成本价' }, { k: '现价' }, { k: '24h' },
     { k: '市值 (¥)' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '自上次更新' },
     { k: '操作', cls: 'l' },
   ],
 };
+
+/** 拖动把手（排序状态下变暗且不可拖） */
+const GRIP = '<td class="drag-col"><span class="grip" title="按住拖动可调整顺序">⠿</span></td>';
+
+/** 面板头部的排序切换按钮 */
+function sortBar(scope) {
+  const s = sortState[scope];
+  const btns = Object.entries(SORT_FIELDS)
+    .map(([key, f]) => {
+      const on = s.by === key;
+      const arrow = on && key !== 'manual' ? (s.desc ? ' ↓' : ' ↑') : '';
+      return `<button class="sort-btn${on ? ' on' : ''}" data-sort="${key}" title="${esc(f.hint)}">${esc(f.label)}${arrow}</button>`;
+    })
+    .join('');
+  return `<div class="sort-bar"><span class="sort-label">排序</span>${btns}</div>`;
+}
 
 function panelStats(key) {
   const b = S.computed.byScope[key];
@@ -383,14 +493,23 @@ function panelStats(key) {
   const items = [
     ['市值', fmt.money(b.marketValue)],
     ['成本', fmt.money(b.cost)],
-    ['浮动盈亏', `<span class="${fmt.cls(b.pnl)}">${fmt.signed(b.pnl)}</span> / <span class="${fmt.cls(b.pnlPct)}">${fmt.pct(b.pnlPct)}</span>`],
+    ['浮动盈亏', `<span class="${fmt.cls(b.pnl)}">${fmt.signedMoney(b.pnl, '¥')}</span> / <span class="${fmt.cls(b.pnlPct)}">${fmt.pct(b.pnlPct)}</span>`],
   ];
   if (key === 'fund') {
     items.push(['日定投合计', fmt.money(S.computed.dca.dailyAmount)]);
     items.push(['待执行交易日', S.computed.dca.pendingDays > 0 ? `<span style="color:var(--gold)">${S.computed.dca.pendingDays} 天</span>` : '已同步']);
     items.push(['累计定投', `${S.computed.dca.totalCount} 笔 · ${fmt.money(S.computed.dca.totalInvested)}`]);
   } else if (key === 'crypto') {
-    items.push(['USD/CNY', Number(S.computed.usdCny).toFixed(4)]);
+    // 加密货币以原币（美元）表达盈亏，人民币是按实时汇率折算的参考值
+    const rateStr = Number(S.computed.usdCny).toFixed(4);
+    const idx = items.findIndex(([k]) => k === '浮动盈亏');
+    items[idx] = [
+      '浮动盈亏 (USD)',
+      `<span class="${fmt.cls(b.pnlNative)}">${fmt.signedMoney(b.pnlNative, '$')}</span> / <span class="${fmt.cls(b.pnlPct)}">${fmt.pct(b.pnlPct)}</span>` +
+        `<br><span class="dim" style="font-weight:400;font-size:11px">${fmt.signedMoney(b.pnl, '¥')}（汇率 ${rateStr}）</span>`,
+    ];
+    items.push(['成本 (USD)', `$${fmt.num(b.costNative, 2)}`]);
+    items.push(['USD/CNY', rateStr]);
   } else {
     items.push(['自上次更新', `<span class="${fmt.cls(b.sinceValueCny)}">${fmt.signed(b.sinceValueCny)}</span>`]);
   }
@@ -398,20 +517,32 @@ function panelStats(key) {
   return items.map(([k, v]) => `<div class="pstat"><span>${k}</span><b>${v}</b></div>`).join('');
 }
 
+/** 标的一栏：名称 + 账户备注徽标 + 代码。同代码多条时，账户是唯一能区分的信息 */
+function whoCell(r, code) {
+  return `<div class="who">
+      <div class="who-top"><b>${esc(r.name)}</b>${r.note ? `<em class="acct" title="账户 / 备注">${esc(r.note)}</em>` : ''}</div>
+      <span>${code}</span>
+    </div>`;
+}
+
 function rowStock(r) {
   const dp = 4;
+  const flag = r.costMismatch
+    ? `<br><span class="badge wait" title="总成本与「数量 × 成本价」不一致，应修正为 ${fmt.money(r.expectedCost)}">成本异常</span>`
+    : '';
   return `<tr data-id="${esc(r.id)}">
-    <td class="l"><div class="who"><b>${esc(r.name)}</b><span>${esc(r.code)}${r.note ? ` · ${esc(r.note)}` : ''}</span></div></td>
+    ${GRIP}
+    <td class="l">${whoCell(r, esc(r.code))}</td>
     <td>${fmt.qty(r.quantity)}</td>
-    <td>${fmt.price(r.avgCost, dp)}</td>
+    <td>${fmt.price(r.avgCost, dp)}${flag}</td>
     <td><b>${fmt.price(r.price, dp)}</b></td>
     <td class="${fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
     <td>${fmt.money(r.marketValue)}</td>
-    <td class="${fmt.cls(r.pnl)}">${fmt.signed(r.pnl)}</td>
+    <td class="${fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
     <td class="${fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
     <td class="${fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 3)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
-    <td class="l"><div class="row-actions"><button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div></td>
+    <td class="l"><div class="row-actions">${r.costMismatch ? `<button class="linky" data-fixcost="${esc(r.id)}">修正成本</button>` : ''}<button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div></td>
   </tr>`;
 }
 
@@ -422,13 +553,14 @@ function rowFund(r) {
     : '<span class="badge">未开启</span>';
   const pending = r.pendingDays > 0 ? `<span class="badge wait">待 ${r.pendingDays} 日</span>` : '';
   return `<tr data-id="${esc(r.id)}">
-    <td class="l"><div class="who"><b>${esc(r.name)}</b><span>${esc(r.code)}${dcaOn && r.lastDcaDate ? ` · 上次定投 ${esc(r.lastDcaDate)}` : ''}${r.note ? ` · ${esc(r.note)}` : ''}</span></div></td>
+    ${GRIP}
+    <td class="l">${whoCell(r, `${esc(r.code)}${dcaOn && r.lastDcaDate ? ` · 上次定投 ${esc(r.lastDcaDate)}` : ''}`)}</td>
     <td>${fmt.qty(r.quantity)}</td>
-    <td>${fmt.price(r.avgCost)}</td>
+    <td>${fmt.cost(r.avgCost)}</td>
     <td><b>${fmt.price(r.nav)}</b><br><span style="font-size:11px" class="dim">${esc(fmt.date(r.navDate))}</span></td>
     <td class="${fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
     <td>${fmt.money(r.marketValue)}</td>
-    <td class="${fmt.cls(r.pnl)}">${fmt.signed(r.pnl)}</td>
+    <td class="${fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
     <td class="${fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
     <td>${dcaCell}<br>${pending}</td>
     <td>${r.dcaCount > 0 ? `${r.dcaCount} 笔<br><span style="font-size:11px" class="dim">${fmt.money(r.dcaInvested)} · ${fmt.qty(r.dcaUnits)} 份</span>` : '<span class="dim">—</span>'}</td>
@@ -441,13 +573,14 @@ function rowFund(r) {
 function rowCrypto(r) {
   const cur = r.currency === 'CNY' ? '¥' : '$';
   return `<tr data-id="${esc(r.id)}">
-    <td class="l"><div class="who"><b>${esc(r.name)}</b><span>${esc(r.symbol)} · ${esc(r.coinId)}${r.priceSource === 'okx' ? ' · <i class="flag">OKX</i>' : ''}${r.note ? ` · ${esc(r.note)}` : ''}</span></div></td>
-    <td>${fmt.qty(r.quantity)}</td>
+    ${GRIP}
+    <td class="l">${whoCell(r, `${esc(r.symbol)} · ${esc(r.coinId)}${r.priceSource === 'okx' ? ' · <i class="flag">OKX</i>' : ''}`)}</td>
+    <td>${fmt.cryptoQty(r.quantity)}</td>
     <td>${cur}${fmt.price(r.costPrice, 2)}</td>
     <td><b>${cur}${fmt.price(r.nativePrice, 2)}</b>${r.currency === 'USD' && r.priceCny ? `<br><span style="font-size:11px" class="dim">¥${fmt.price(r.priceCny, 2)}</span>` : ''}</td>
     <td class="${fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
     <td>${fmt.money(r.marketValue)}</td>
-    <td class="${fmt.cls(r.pnl)}">${fmt.signed(r.pnl)}</td>
+    <td class="${fmt.cls(r.pnlNative)}"><b>${fmt.signedMoney(r.pnlNative, cur)}</b><br><span style="font-size:11px" class="dim">${fmt.signedMoney(r.pnl, '¥')}</span></td>
     <td class="${fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
     <td class="${fmt.cls(r.sinceChange)}">${cur}${fmt.signed(r.sinceChange, 2)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
     <td class="l"><div class="row-actions"><button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div></td>
@@ -457,10 +590,12 @@ function rowCrypto(r) {
 const ROW_FN = { stock: rowStock, fund: rowFund, crypto: rowCrypto };
 
 function renderTable(key) {
-  const rows = key === 'stock' ? S.stocks : key === 'fund' ? S.funds : S.crypto;
+  const all = rowsOfScope(key);
+  const rows = sortRows(key, all);
+  const manual = sortState[key].by === 'manual';
   const prefix =
     key === 'stock'
-      ? '每行记录一只股票的持股与成本；「自上次更新」按上次更新时保存的价格计算变化。'
+      ? '每行记录一只股票的持股与成本；「自上次更新」按上次更新时保存的价格计算变化。同一代码可以有多条，用「账户 / 备注」区分。'
       : key === 'fund'
         ? '日定投在每次「更新净值」时，按 (上次定投日, 最新净值日] 之间每一个交易日的净值折算份额。'
         : '加密货币以 CoinGecko 计价（失败自动切 OKX）；成本按「计价货币」计入。';
@@ -474,10 +609,10 @@ function renderTable(key) {
     <section class="panel">
       <div class="panel-head">
         <div class="panel-stats">${panelStats(key)}</div>
-        <button class="btn-ghost" data-add="${key}">+ 添加${SCOPE_META[key].title}</button>
+        <div class="head-tools">${sortBar(key)}<button class="btn-ghost" data-add="${key}">+ 添加${SCOPE_META[key].title}</button></div>
       </div>
-      <p class="dim" style="font-size:12px;margin:-6px 0 16px;max-width:860px">${prefix}</p>
-      <div class="table-wrap">
+      <p class="dim" style="font-size:12px;margin:-6px 0 16px;max-width:860px">${prefix}${manual ? '当前为自定义顺序，<b>按住行首的 ⠿ 可拖动调整</b>。' : '当前为排序视图，切回「自定义」才能拖动。'}</p>
+      <div class="table-wrap${manual ? ' manual' : ' sorted'}">
         <table>
           <thead><tr>${cols}</tr></thead>
           <tbody>${body}</tbody>
@@ -485,6 +620,84 @@ function renderTable(key) {
         ${rows.length ? '' : `<div class="empty"><div class="seal-ghost">空</div><p>还没有${SCOPE_META[key].title}记录</p><p class="small">点击右上角「+ 添加${SCOPE_META[key].title}」开始记账</p></div>`}
       </div>
     </section>`;
+}
+
+/* ------------------------------------------------------------ 排序与拖动 */
+
+function changeSort(scope, by) {
+  if (!SORT_FIELDS[by]) return;
+  const s = sortState[scope];
+  if (s.by === by) {
+    if (by === 'manual') return; // 已经是自定义顺序，无需变化
+    s.desc = !s.desc; // 再点同一个字段 → 切换升/降序
+  } else {
+    s.by = by;
+    s.desc = true; // 换字段时默认降序（市值/盈亏都是「大的在前」更常用）
+  }
+  saveSortState();
+  render();
+}
+
+/**
+ * 行拖动排序。只在「自定义」顺序下启用；拖动结束后把整张表的 id 顺序提交给服务端保存。
+ * 事件委托挂在 tbody 上，每次 render 都会重建 tbody，所以不会重复绑定。
+ */
+function wireDrag(view, scope) {
+  const tbody = view.querySelector('tbody');
+  if (!tbody || sortState[scope]?.by !== 'manual') return;
+  tbody.querySelectorAll('tr').forEach((tr) => tr.setAttribute('draggable', 'true'));
+
+  let dragging = null;
+  let moved = false;
+
+  tbody.addEventListener('dragstart', (e) => {
+    const tr = e.target.closest('tr');
+    if (!tr || !tr.draggable) return;
+    dragging = tr;
+    moved = false;
+    tr.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try {
+      e.dataTransfer.setData('text/plain', tr.dataset.id || '');
+    } catch {
+      /* 某些浏览器在只读上下文里会拒绝 */
+    }
+  });
+
+  tbody.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const over = e.target.closest('tr');
+    if (!over || over === dragging) return;
+    // 直接搬动 DOM，所见即所得；松手后把最终顺序读出来提交
+    const rect = over.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    tbody.insertBefore(dragging, after ? over.nextSibling : over);
+    moved = true;
+  });
+
+  tbody.addEventListener('drop', (e) => {
+    if (dragging) e.preventDefault();
+  });
+
+  tbody.addEventListener('dragend', async () => {
+    if (!dragging) return;
+    dragging.classList.remove('dragging');
+    dragging = null;
+    if (!moved) return; // 只是点了一下没移动
+    const ids = [...tbody.querySelectorAll('tr')].map((tr) => tr.dataset.id).filter(Boolean);
+    const before = rowsOfScope(scope).map((x) => x.id);
+    if (ids.join('|') === before.join('|')) return;
+    try {
+      const res = await api('/api/order', { method: 'POST', body: { scope, ids } });
+      applyState(res.state);
+      toast('顺序已保存', [`共 ${ids.length} 条`], 'ok', 1600);
+    } catch (err) {
+      toast('排序保存失败', [err.message], 'err');
+      render();
+    }
+  });
 }
 
 /* ============================================================ 设置 */
@@ -518,6 +731,23 @@ function renderSettings() {
 
       <div class="set-section">
         <div class="set-head"><h3>数据管理</h3><em>Data</em></div>
+        <div class="set-row">
+          <div class="set-label">
+            <b>导出数据</b>
+            <span>把当前全部持仓与流水下载成一个 JSON 文件，可直接当备份保存。当前共 ${total} 项：股票 ${counts.stock} · 基金 ${counts.fund} · 加密货币 ${counts.crypto}。</span>
+          </div>
+          <div class="set-action"><button class="btn-ghost" id="setExport">导出 JSON</button></div>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <b>导入数据</b>
+            <span>选一个之前导出的 JSON 文件，<b>覆盖</b>当前全部数据。导入前会自动把现有数据备份到 <b class="mono">data/backups/</b>，导错了可以回退。</span>
+          </div>
+          <div class="set-action">
+            <button class="btn-ghost" id="setImport">选择文件…</button>
+            <input type="file" id="importFile" accept=".json,application/json" hidden />
+          </div>
+        </div>
         <div class="set-row">
           <div class="set-label">
             <b>重建演示数据</b>
@@ -557,8 +787,64 @@ function renderSettings() {
 
 function wireSettings() {
   $('#setContrast')?.addEventListener('change', (e) => applyContrast(e.target.checked));
+  $('#setExport')?.addEventListener('click', exportData);
+  $('#setImport')?.addEventListener('click', () => $('#importFile')?.click());
+  $('#importFile')?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // 允许连续导入同一个文件
+    if (file) importData(file);
+  });
   $('#setDemo')?.addEventListener('click', rebuildDemo);
   $('#setClear')?.addEventListener('click', clearAll);
+}
+
+/** 导出：走服务端的下载接口，浏览器按 Content-Disposition 存成文件 */
+function exportData() {
+  const a = document.createElement('a');
+  a.href = `/api/export?t=${Date.now()}`;
+  a.rel = 'noopener';
+  document.body.append(a);
+  a.click();
+  a.remove();
+  toast('已开始下载备份', ['内容为全部持仓与流水记录']);
+}
+
+/** 导入：先解析看清里面有多少东西，再让用户确认覆盖 */
+async function importData(file) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (err) {
+    toast('导入失败', ['文件不是合法的 JSON：' + err.message], 'err');
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    toast('导入失败', ['文件内容不是一个 JSON 对象'], 'err');
+    return;
+  }
+  const n = (k) => (Array.isArray(parsed[k]) ? parsed[k].length : 0);
+  if (!n('stocks') && !n('funds') && !n('crypto')) {
+    toast('导入失败', ['文件里没有 stocks / funds / crypto 字段，可能不是本程序导出的备份'], 'err');
+    return;
+  }
+  const ok = window.confirm(
+    `用「${file.name}」覆盖当前数据？\n\n` +
+      `导入内容：股票 ${n('stocks')} · 基金 ${n('funds')} · 加密货币 ${n('crypto')}\n` +
+      `当前数据：股票 ${S.stocks.length} · 基金 ${S.funds.length} · 加密货币 ${S.crypto.length}\n\n` +
+      `现有数据会先自动备份到 data/backups/。`,
+  );
+  if (!ok) return;
+
+  showBusy('正在导入数据', '校验并写入…');
+  try {
+    const res = await api('/api/import', { method: 'POST', body: { data: parsed } });
+    hideBusy();
+    applyState(res.state);
+    toast(res.message, [res.backup ? `原数据已备份为 ${res.backup}` : '（原本没有数据文件，未产生备份）'], 'ok', 9000);
+  } catch (err) {
+    hideBusy();
+    toast('导入失败', [err.message], 'err');
+  }
 }
 
 /** 重建演示数据：过程要联网数秒，显示遮罩 + 轮询真实进度 */
@@ -629,6 +915,9 @@ function render() {
     view.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => openDrawer(tab, b.dataset.edit)));
     view.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeAsset(tab, b.dataset.del)));
     view.querySelectorAll('[data-add]').forEach((b) => b.addEventListener('click', () => openDrawer(b.dataset.add)));
+    view.querySelectorAll('[data-fixcost]').forEach((b) => b.addEventListener('click', () => fixCost(tab, b.dataset.fixcost)));
+    view.querySelectorAll('[data-sort]').forEach((b) => b.addEventListener('click', () => changeSort(tab, b.dataset.sort)));
+    wireDrag(view, tab);
   }
 
   // 更新后闪烁提示（只作用于当前可见视图，过期的条目自动丢弃）
@@ -674,6 +963,8 @@ const drawer = {
   id: null,
   initial: {},
   preview: null,
+  /** 记录用户手动改过哪些字段（如 name / symbol），用于判断能否自动带出 */
+  touched: {},
 };
 
 /** 表单里显示的数值：去掉浮点尾数，避免出现 1343.09078085 这种难看的值 */
@@ -699,6 +990,7 @@ function openDrawer(scope, id = null) {
   drawer.scope = scope;
   drawer.id = id;
   drawer.preview = null;
+  drawer.touched = {};
   const asset = id ? (scope === 'stock' ? S.stocks : scope === 'fund' ? S.funds : S.crypto).find((x) => x.id === id) : null;
 
   $('#drawerKind').textContent = id ? '修改记录' : '新增记录';
@@ -716,9 +1008,18 @@ function openDrawer(scope, id = null) {
       <span class="hint" id="codeHint">支持 A 股代码、基金代码、名称、拼音首字母</span>
     </div>`;
     html += field('名称', 'name', { value: asset?.name || '' });
+    // 成本字段必须与表格里的「均价」显示同一个值。
+    // 之前抽屉显示 costPrice、表格显示 costAmount÷数量，两者脱节时用户会看到
+    // “表格里均价是错的、打开抽屉却已经是想改的那个数”，于是改不动也提交不出去。
+    // 加密货币例外：均价是折算后的人民币，输入框要的是原币，单位不同不能混用。
+    const costLabel = asset
+      ? scope === 'crypto' ? '成本价' : scope === 'fund' ? '持仓均价（由总成本推算）' : '持仓成本价'
+      : scope === 'fund' ? '成本价（单位净值）' : '成本价';
+    const costValue = asset ? numStr(scope === 'crypto' ? asset.costPrice : asset.avgCost, scope === 'fund' ? 6 : 4) : '';
+    const costHint = asset && scope !== 'crypto' ? '与表格里的「均价」是同一个值；改动后会按 数量 × 该值 重算总成本。' : '';
     html += `<div class="field-row">
       ${field(scope === 'fund' ? '持有份额' : '持股数量', 'quantity', { type: 'number', step: 'any', value: asset ? numStr(asset.quantity, 4) : '', placeholder: scope === 'fund' ? '1000' : '100' })}
-      ${field(scope === 'fund' ? '持仓成本价（单位净值）' : '成本价', 'costPrice', { type: 'number', step: 'any', value: asset ? numStr(asset.costPrice ?? asset.avgCost, 4) : '', placeholder: scope === 'fund' ? '2.5' : '1180.5' })}
+      ${field(costLabel, 'costPrice', { type: 'number', step: 'any', value: costValue, hint: costHint, placeholder: scope === 'fund' ? '2.5' : '1180.5' })}
     </div>`;
     if (scope === 'fund') {
       html += field('持仓总成本（¥）', 'costAmount', {
@@ -738,7 +1039,11 @@ function openDrawer(scope, id = null) {
       <div class="field-row">
         ${field('每期金额（¥）', 'dcaAmount', { type: 'number', step: 'any', value: String(dca.amount ?? 100) })}
         ${field('起始日期', 'dcaStartDate', { type: 'date', value: dca.startDate || S.computed.today })}
-      </div>`;
+      </div>
+      ${asset ? `<div class="field">
+        <label class="switch"><input type="checkbox" name="resetDca" /><span class="track"></span><b>重置定投记录</b></label>
+        <span class="hint">勾选并保存后，会清空已定投笔数 / 累计投入 / 上次定投日，下次更新从「起始日期」重新补算。<b>只在你把这一行换成另一只基金时才需要</b>；只是改代码笔误不要勾，否则会重复扣一遍定投。</span>
+      </div>` : ''}`;
     }
   } else {
     html += `<div class="field autocomplete">
@@ -752,8 +1057,14 @@ function openDrawer(scope, id = null) {
       ${field('符号', 'symbol', { value: asset?.symbol || '', placeholder: 'BTC' })}
     </div>`;
     html += `<div class="field-row">
-      ${field('持有数量', 'quantity', { type: 'number', step: 'any', value: asset ? numStr(asset.quantity, 4) : '', placeholder: '0.35' })}
-      ${field('成本价', 'costPrice', { type: 'number', step: 'any', value: asset ? numStr(asset.costPrice, 2) : '', placeholder: '61200' })}
+      ${field('持有数量', 'quantity', { type: 'number', step: 'any', value: asset ? numStr(asset.quantity, 15) : '', placeholder: '0.35' })}
+      ${field('成本价', 'costPrice', {
+        type: 'number',
+        step: 'any',
+        value: asset ? numStr(asset.costPrice, 2) : '',
+        placeholder: '61200',
+        hint: `按${asset?.currency === 'CNY' ? '人民币' : '美元'}计价。盈亏按「数量 ×（现价 − 成本价）」计算，人民币金额用实时汇率折算，不锁定入库时的汇率。`,
+      })}
     </div>`;
     html += `<div class="field">
       <label for="f_currency">计价货币</label>
@@ -765,7 +1076,11 @@ function openDrawer(scope, id = null) {
     </div>`;
   }
 
-  html += field('备注', 'note', { value: asset?.note || '', placeholder: '可选，例如：券商账户 / 长期底仓' });
+  html += field('账户 / 备注', 'note', {
+    value: asset?.note || '',
+    placeholder: '例如：华泰证券 / 币安 / 招行',
+    hint: '同一个代码可以添加多条（例如同一只股票放在不同券商），用这里区分；<b>同代码 + 同备注</b>会被视为重复而拒绝。',
+  });
   html += `<div class="preview" id="preview"><div class="pr"><span>参考行情</span><b>填写代码后自动获取</b></div></div>`;
 
   form.innerHTML = html;
@@ -844,8 +1159,24 @@ function bindDrawer(scope, asset) {
     if (asset) removeAsset(scope, asset.id);
   };
 
+  // 记录「名称 / 符号」是否被手动改过：没改过时换代码会自动带出新标的名称
+  for (const key of ['name', 'symbol']) {
+    const el = form.elements[key];
+    el?.addEventListener('input', () => {
+      drawer.touched[key] = true;
+    });
+  }
+
+  // 代码改了就先探一下新标的。之前不做这一步，用户会看到「名字换了、市价还是旧的」而无从判断
+  codeInput?.addEventListener('blur', () => {
+    const val = codeInput.value.trim();
+    const original = String(asset?.code || asset?.coinId || '');
+    if (!val || val === original) return;
+    lookupAndShow(scope, val);
+  });
+
   updatePreview(scope, asset);
-  if (asset && codeInput) lookupAndShow(scope, asset.code);
+  if (asset && codeInput) lookupAndShow(scope, asset.code || asset.coinId);
 }
 
 async function searchSuggest(scope, q) {
@@ -869,9 +1200,9 @@ async function searchSuggest(scope, q) {
       d.onclick = () => {
         $('#f_code').value = d.dataset.code;
         const nameEl = $('#drawerForm').elements.name;
-        if (nameEl && !nameEl.value) nameEl.value = d.dataset.name;
+        if (nameEl && !drawer.touched?.name) nameEl.value = d.dataset.name;
         const symEl = $('#drawerForm').elements.symbol;
-        if (symEl && !symEl.value && d.dataset.symbol) symEl.value = d.dataset.symbol;
+        if (symEl && !drawer.touched?.symbol && d.dataset.symbol) symEl.value = d.dataset.symbol;
         box.hidden = true;
         lookupAndShow(drawer.scope, d.dataset.code);
       };
@@ -889,10 +1220,10 @@ async function lookupAndShow(scope, code) {
   try {
     const { asset } = await api(`/api/lookup?scope=${scope}&code=${encodeURIComponent(code)}`);
     drawer.preview = asset;
-    if (asset.name && !$('#drawerForm').elements.name?.value) $('#drawerForm').elements.name.value = asset.name;
-    if (scope === 'crypto' && asset.symbol && !$('#drawerForm').elements.symbol?.value) {
-      $('#drawerForm').elements.symbol.value = asset.symbol;
-    }
+    const form = $('#drawerForm');
+    // 只有用户没手动填过名称时才自动带出，避免覆盖他的输入
+    if (asset.name && !drawer.touched?.name && form.elements.name) form.elements.name.value = asset.name;
+    if (asset.symbol && !drawer.touched?.symbol && form.elements.symbol) form.elements.symbol.value = asset.symbol;
     updatePreview(scope);
   } catch (err) {
     pv.innerHTML = `<div class="pr"><span>参考行情</span><b style="color:var(--seal-2)">${esc(err.message)}</b></div>`;
@@ -908,8 +1239,25 @@ function updatePreview(scope, asset) {
   const live = drawer.preview?.price;
   const rows = [];
 
+  // 代码被改过：明确告知会发生什么，避免出现「名字换了、市价还是旧的」这种误解
+  const originalCode = asset ? String(asset.code || asset.coinId || '') : '';
+  const codeNow = String(v.code || '').trim();
+  const codeSwitched = Boolean(asset && codeNow && codeNow !== originalCode);
+
+  if (asset?.costMismatch) {
+    rows.push(['成本数据异常', `总成本 ${fmt.money(asset.cost)} 与 数量×成本价 ${fmt.money(asset.expectedCost)} 不一致，保存后会自动修正`]);
+  }
+
+  if (codeSwitched) {
+    rows.push(['代码变更', `${originalCode} → ${codeNow}`]);
+    rows.push(['保存后', '清空原有走势与「自上次更新」基准，并按新标的重新取价']);
+  }
+
   if (asset) {
-    rows.push(['当前行情', live != null ? `${fmt.price(live)}（${asset.priceDate || asset.lastUpdate || '—'}）` : '—']);
+    rows.push([
+      codeSwitched ? '原标的行情' : '当前行情',
+      live != null ? `${fmt.price(live)}（${asset.priceDate || asset.lastUpdate || '—'}）` : '—',
+    ]);
   } else if (live != null) {
     rows.push(['最新行情', fmt.price(live)]);
   } else {
@@ -919,8 +1267,18 @@ function updatePreview(scope, asset) {
   if (scope === 'crypto') {
     const cur = v.currency === 'CNY' ? '¥' : '$';
     const rate = v.currency === 'CNY' ? 1 : Number(S.computed.usdCny) || 7.1;
-    rows.push(['本次投入成本', fmt.money(qty * price * rate)]);
-    if (live != null) rows.push(['按最新价的参考市值', fmt.money(qty * (v.currency === 'CNY' ? drawer.preview.priceCny ?? live : live) * rate)]);
+    // 原币（美元）口径为主，人民币一律用实时汇率折算
+    const costNative = qty * price;
+    const liveNative = live != null ? (v.currency === 'CNY' ? drawer.preview?.priceCny ?? live : live) : null;
+    rows.push(['成本（原币）', `${cur}${fmt.num(costNative, 2)}`]);
+    rows.push(['人民币成本', `${fmt.money(costNative * rate)}<span class="dim">（汇率 ${rate.toFixed(4)}）</span>`]);
+    if (liveNative != null) {
+      const pnlNative = qty * (liveNative - price);
+      rows.push([
+        '按最新价的盈亏',
+        `${fmt.signedMoney(pnlNative, cur)} / ${fmt.signedMoney(pnlNative * rate, '¥')}`,
+      ]);
+    }
     rows.push(['计价货币', cur]);
   } else if (scope === 'fund') {
     const total = v.costAmount !== '' && v.costAmount !== undefined && !assetCostDirty(v, asset) ? Number(v.costAmount) || 0 : qty * price;
@@ -932,6 +1290,7 @@ function updatePreview(scope, asset) {
     if (live != null) rows.push(['按最新价的市值', fmt.money(qty * live)]);
   }
 
+  pv.classList.toggle('warn', codeSwitched || Boolean(asset?.costMismatch));
   pv.innerHTML = rows.map(([k, val]) => `<div class="pr"><span>${esc(k)}</span><b>${esc(val)}</b></div>`).join('');
 }
 
@@ -954,7 +1313,6 @@ async function submitDrawer() {
       const init = drawer.initial;
       const data = {};
       for (const [k, val] of Object.entries(v)) {
-        if (k === 'code') continue;
         if (String(val) !== String(init[k])) data[k] = val;
       }
       if (scope === 'fund') {
@@ -963,13 +1321,21 @@ async function submitDrawer() {
           amount: Number(v.dcaAmount) || 0,
           startDate: v.dcaStartDate,
         };
+        // 勾了才提交，false 时不发，避免误清定投记录
+        if (v.resetDca) data.resetDca = true;
       }
       if (data.quantity !== undefined) data.quantity = Number(data.quantity);
       if (data.costPrice !== undefined) data.costPrice = Number(data.costPrice);
       if (data.costAmount !== undefined) data.costAmount = Number(data.costAmount);
+      // 打开时成本就已脱节的记录：保存时顺手修正，用户不必知道要改哪个字段
+      const cur = (scope === 'stock' ? S.stocks : scope === 'fund' ? S.funds : S.crypto).find((x) => x.id === drawer.id);
+      if (cur?.costMismatch) data.recalcCost = true;
       const res = await api('/api/assets', { method: 'PATCH', body: { scope, id: drawer.id, data } });
       applyState(res.state);
-      toast(res.message, [`${scope === 'fund' ? '份额' : '数量'} ${fmt.qty(res.asset.quantity)} · 总成本 ${fmt.money(res.asset.costAmount)}`]);
+      toast(res.message, [
+        `${scope === 'fund' ? '份额' : '数量'} ${fmt.qty(res.asset.quantity)} · 总成本 ${fmt.money(res.asset.costAmount)}`,
+        ...(res.refreshed ? [`代码已改为 ${res.asset.code || res.asset.coinId}，旧行情已清空并按新标的取价`] : []),
+      ]);
     } else {
       const data = { code: v.code.trim(), name: v.name.trim(), quantity: Number(v.quantity) || 0, costPrice: Number(v.costPrice) || 0, note: v.note };
       if (scope === 'fund') {
@@ -988,6 +1354,27 @@ async function submitDrawer() {
     toast('操作失败', [err.message], 'err');
   } finally {
     btn.disabled = false;
+  }
+}
+
+/**
+ * 一键修正「总成本与 数量×成本价 脱节」的记录。
+ * 历史 bug：只改持股数不重算总成本，于是均价 = 总成本 ÷ 数量 变成了第三个值。
+ */
+async function fixCost(scope, id) {
+  const asset = (scope === 'stock' ? S.stocks : scope === 'fund' ? S.funds : S.crypto).find((x) => x.id === id);
+  if (!asset) return;
+  const ok = window.confirm(
+    `把「${asset.name}」的总成本修正为：\n\n    数量 × 成本价 = ${fmt.qty(asset.quantity)} × ${fmt.price(asset.costPrice, 4)} = ${fmt.money(asset.expectedCost)}\n\n` +
+      `当前总成本：${fmt.money(asset.cost)}（均价 ${fmt.price(asset.avgCost, 4)}）`,
+  );
+  if (!ok) return;
+  try {
+    const res = await api('/api/assets', { method: 'PATCH', body: { scope, id, data: { recalcCost: true } } });
+    applyState(res.state);
+    toast(`已修正 ${asset.name} 的成本`, [`总成本 ${fmt.money(asset.cost)} → ${fmt.money(asset.expectedCost)}`]);
+  } catch (err) {
+    toast('修正失败', [err.message], 'err');
   }
 }
 
@@ -1013,8 +1400,16 @@ async function runUpdate(scope) {
   btn.disabled = true;
   btn.classList.add('busy');
   const t0 = Date.now();
+
+  // 与「重建演示」同一套遮罩 + 真实进度；延迟 350ms 才弹，
+  // 免得只有一两只标的、半秒就结束时闪一下反而碍眼
+  const title = scope === 'all' ? '正在更新全部行情' : `正在更新${SCOPE_META[scope]?.title || ''}行情`;
+  const overlayTimer = setTimeout(() => startBusyPolling(title, '正在连接行情源…'), 350);
+
   try {
     const res = await api('/api/update', { method: 'POST', body: { scope } });
+    clearTimeout(overlayTimer);
+    hideBusy();
     const reports = res.reports || [];
 
     // 把发生变化的行标记出来，渲染后闪烁
@@ -1054,6 +1449,8 @@ async function runUpdate(scope) {
       toast('部分标的更新失败', allErrors.slice(0, 5).map((e) => `${e.name}: ${e.message}`), 'err', 9000);
     }
   } catch (err) {
+    clearTimeout(overlayTimer);
+    hideBusy();
     toast('更新失败', [err.message], 'err');
   } finally {
     btn.disabled = false;
@@ -1065,6 +1462,7 @@ async function runUpdate(scope) {
 
 async function boot() {
   initContrast();
+  loadSortState();
   $$('.nav-item').forEach((n) => n.addEventListener('click', () => switchTab(n.dataset.tab)));
   $('#btnUpdate').addEventListener('click', () => runUpdate(tab === 'overview' ? 'all' : tab));
   $('#drawerClose').addEventListener('click', closeDrawer);

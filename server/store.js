@@ -127,4 +127,24 @@ export async function mutate(fn) {
   });
 }
 
+/**
+ * 把当前数据文件复制一份到 data/backups/。
+ * 用于「导入 / 清空 / 重建演示」这类破坏性操作之前 —— 出事有得回退。
+ * @returns {Promise<string|null>} 备份文件路径；原本没有数据文件时返回 null
+ */
+export async function backupNow(tag = 'backup') {
+  let text;
+  try {
+    text = await fs.readFile(DATA_FILE, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  await fs.mkdir(BACKUP_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replaceAll(':', '-').slice(0, 19);
+  const file = path.join(BACKUP_DIR, `${tag}-${stamp}.json`);
+  await fs.writeFile(file, text, 'utf8');
+  return file;
+}
+
 export const paths = { DATA_DIR, DATA_FILE, BACKUP_DIR };

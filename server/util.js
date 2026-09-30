@@ -106,11 +106,23 @@ export function isAfter(a, b) {
   return a && b ? a > b : false;
 }
 
+/**
+ * 数量（股数 / 份额 / 币的数量）的存储精度。
+ * 加密货币的数量常常很小，8 位会把 0.008090321234567 截成 0.00809032；
+ * 15 位是双精度浮点能可靠表达的量级（再多就是虚假精度了）。
+ */
+export const QTY_DP = 15;
+
 /** 保留小数位，避免浮点尾数 */
 export function round(n, dp = 2) {
   if (n === null || n === undefined || Number.isNaN(Number(n))) return 0;
+  const v = Number(n);
   const f = 10 ** dp;
-  return Math.round((Number(n) + Number.EPSILON) * f) / f;
+  const scaled = v * f;
+  // 缩放后超出双精度安全整数范围时不取整：那只会引入误差，
+  // 而原值本身已经到了浮点精度的极限（dp=15 配合很大的数量会命中这里）
+  if (!Number.isFinite(scaled) || Math.abs(scaled) >= Number.MAX_SAFE_INTEGER) return v;
+  return Math.round((v + Number.EPSILON) * f) / f;
 }
 
 /** 安全数字 */

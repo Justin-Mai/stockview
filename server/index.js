@@ -9,13 +9,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 
-import { load, mutate, paths, emptyState } from './store.js';
+import { load, mutate, paths, emptyState, backupNow, normalizeState } from './store.js';
 import { buildDemoState } from './seed.js';
 import * as pf from './portfolio.js';
 import * as cn from './providers/cn.js';
 import * as crypto from './providers/crypto.js';
-import { addAsset, deleteAsset, updateAsset, primeAsset } from './portfolio.js';
+import { addAsset, deleteAsset, updateAsset, primeAsset, reorderAssets } from './portfolio.js';
 import { beginTask, currentTask, endTask, reportProgress } from './tasks.js';
+import { nowStamp } from './util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(path.resolve(__dirname, '..'), 'web');
@@ -108,6 +109,19 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const { scope, data } = body;
     const { state, result } = await mutate(async (s) => {
+      // 加密货币的人民币成本要用汇率折算，先把汇率刷成本次的真实值，
+      // 否则会退回硬编码的 7.1，导致成本高估、盈亏低估（成本入库后不会再改）
+      if (scope === 'crypto') {
+        try {
+          const rate = await crypto.getUsdCny();
+          if (rate) {
+            s.meta.usdCny = rate;
+            s.meta.usdCnyAt = nowStamp();
+          }
+        } catch {
+          /* 沿用已有汇率 */
+        }
+      }
       const asset = addAsset(s, scope, data || {});
       await primeAsset(s, scope, asset); // 立刻取一次行情，避免新记录显示成本价
       return asset;
@@ -119,8 +133,18 @@ async function handleApi(req, res, url) {
   if ((req.method === 'PATCH' || req.method === 'PUT') && route === '/assets') {
     const body = await readBody(req);
     const { scope, id, data } = body;
-    const { state, result } = await mutate((s) => updateAsset(s, scope, id, data || {}));
-    return ok(res, { asset: result, state: await snapshot(state), message: `已保存 ${result.name}` });
+    const { state, result } = await mutate(async (s) => {
+      const { asset, codeChanged } = updateAsset(s, scope, id, data || {});
+      // 改了代码等于换了一只标的：清空旧行情后立刻重新取价，否则会拿着 A 的市价显示 B
+      if (codeChanged) await primeAsset(s, scope, asset);
+      return { asset, codeChanged };
+    });
+    return ok(res, {
+      asset: result.asset,
+      state: await snapshot(state),
+      refreshed: result.codeChanged,
+      message: result.codeChanged ? `已保存 ${result.asset.name}，并重新获取行情` : `已保存 ${result.asset.name}`,
+    });
   }
 
   // 删除资产
@@ -132,16 +156,32 @@ async function handleApi(req, res, url) {
   }
 
   // 执行更新（股票 / 基金 / 加密货币 / 全部）
+  // 与「重建演示数据」一样开一个长任务，前端轮询 /api/task 显示「正在获取 XX 日线…」这类真实进度
   if (req.method === 'POST' && route === '/update') {
     const body = await readBody(req).catch(() => ({}));
     const scope = body.scope || 'all';
     const scopes = scope === 'all' ? ['stock', 'fund', 'crypto'] : [scope];
+    const title = scope === 'all' ? '正在更新全部行情' : `正在更新${pf.SCOPE_LABEL[scope] || ''}行情`;
+
     const { state, result } = await mutate(async (s) => {
-      const reports = [];
-      for (const sc of scopes) {
-        reports.push(await pf.runUpdate(s, sc));
+      const total = scopes.reduce((n, sc) => n + pf.countAssets(s, sc), 0);
+      let step = 0;
+      beginTask(title, total);
+      const onProgress = (p) => {
+        if (p && p.advance) step += 1;
+        reportProgress({ step, total, label: p?.label });
+      };
+      try {
+        const reports = [];
+        for (const sc of scopes) reports.push(await pf.runUpdate(s, sc, { onProgress }));
+        // 没有资产时总步数为 0，直接标成完成，避免进度条停在 0
+        if (total === 0) reportProgress({ step: 0, total: 0, label: '没有需要更新的持仓' });
+        endTask();
+        return reports;
+      } catch (err) {
+        endTask(err);
+        throw err;
       }
-      return reports;
     });
     return ok(res, { reports: result, state: await snapshot(state) });
   }
@@ -191,6 +231,7 @@ async function handleApi(req, res, url) {
     const body = await readBody(req).catch(() => ({}));
     const mode = body.mode === 'demo' ? 'demo' : 'empty';
     const isDemo = mode === 'demo';
+    const backup = await backupNow(isDemo ? 'before-demo' : 'before-clear'); // 破坏性操作前先留一份
     if (isDemo) beginTask('正在重建演示数据');
 
     let state;
@@ -209,7 +250,57 @@ async function handleApi(req, res, url) {
 
     return ok(res, {
       state: await snapshot(state),
+      backup: backup ? path.basename(backup) : null,
       message: isDemo ? '已重建演示数据' : '已清空全部数据',
+    });
+  }
+
+  // 拖动排序后保存顺序
+  if (req.method === 'POST' && route === '/order') {
+    const body = await readBody(req);
+    const { scope, ids } = body;
+    const { state, result } = await mutate((s) => reorderAssets(s, scope, ids || []));
+    return ok(res, { count: result, state: await snapshot(state), message: '排序已保存' });
+  }
+
+  // 导出：直接下载数据文件（浏览器会按 Content-Disposition 存成文件）
+  if (req.method === 'GET' && route === '/export') {
+    const state = await load();
+    const body = JSON.stringify(state, null, 2);
+    const stamp = new Date().toISOString().slice(0, 16).replaceAll(':', '-');
+    const ascii = `stockview-${stamp}.json`;
+    const zh = `股票账本-${stamp}.json`;
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      // 同时给 ASCII 与 UTF-8 文件名：老浏览器用前者，现代浏览器优先用后者
+      'content-disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(zh)}`,
+      'cache-control': 'no-store',
+    });
+    return res.end(body);
+  }
+
+  // 导入：用上传的 JSON 覆盖全部数据（写之前自动备份现有数据）
+  if (req.method === 'POST' && route === '/import') {
+    const body = await readBody(req);
+    const payload = body?.data ?? body?.state ?? body;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('文件内容不是一个 JSON 对象');
+    }
+    const hasAny = ['stocks', 'funds', 'crypto'].some((k) => Array.isArray(payload[k]));
+    if (!hasAny) throw new Error('文件里没有 stocks / funds / crypto 字段，可能不是本程序导出的备份');
+
+    const next = normalizeState(payload);
+    const backup = await backupNow('before-import');
+    const { state } = await mutate(async (s) => {
+      for (const k of Object.keys(s)) delete s[k];
+      Object.assign(s, next);
+      return next;
+    });
+    const summary = `股票 ${next.stocks.length} · 基金 ${next.funds.length} · 加密货币 ${next.crypto.length}`;
+    return ok(res, {
+      state: await snapshot(state),
+      backup: backup ? path.basename(backup) : null,
+      message: `已导入数据（${summary}）`,
     });
   }
 
