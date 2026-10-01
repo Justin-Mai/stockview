@@ -59,6 +59,10 @@ export function normalizeState(raw) {
   state.funds = Array.isArray(raw.funds) ? raw.funds : [];
   state.crypto = Array.isArray(raw.crypto) ? raw.crypto : [];
   state.logs = Array.isArray(raw.logs) ? raw.logs.slice(-600) : [];
+  // 历史版本 / 手工改过的 JSON 里没有 hidden 字段，统一收敛成布尔值
+  for (const list of [state.stocks, state.funds, state.crypto]) {
+    for (const asset of list) asset.hidden = Boolean(asset.hidden);
+  }
   // 历史版本 / 演示数据可能写入过全量净值序列（数千条），在这里统一收口
   for (const list of [state.stocks, state.funds, state.crypto]) {
     for (const asset of list) capHistory(asset);

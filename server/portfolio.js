@@ -60,6 +60,8 @@ function baseAsset(scope, data) {
     createdAt: nowStamp(),
     updatedAt: nowStamp(),
     note: data.note ? String(data.note) : '',
+    /** 屏蔽：不计入任何合计，行仍在表里显示（标注提示） */
+    hidden: Boolean(data.hidden),
     history: [],
     lastUpdate: null,
     baselinePrice: null,
@@ -90,6 +92,7 @@ export function addAsset(state, scope, data = {}) {
   const quantity = round(num(data.quantity), QTY_DP);
   if (quantity < 0) throw new Error('数量不能为负');
   const costPrice = round(num(data.costPrice), 6);
+  const hidden = Boolean(data.hidden);
 
   if (scope === 'crypto') {
     const list = state.crypto;
@@ -97,7 +100,8 @@ export function addAsset(state, scope, data = {}) {
       throw new Error(`${name} 已有一条备注为「${note || '空'}」的记录；若放在不同账户，请在备注里填上账户名区分`);
     }
     const currency = data.currency === 'CNY' ? 'CNY' : 'USD';
-    const usdCny = num(state.meta.usdCny, 7.1) || 7.1;
+    // 汇率兜底优先级：本次已取到的实时汇率 → 上次成功取到的汇率 → 7.1
+    const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
     const rate = currency === 'CNY' ? 1 : usdCny;
     const asset = {
       ...baseAsset(scope, data),
@@ -105,6 +109,7 @@ export function addAsset(state, scope, data = {}) {
       symbol: String(data.symbol ?? '').trim().toUpperCase() || code.toUpperCase(),
       name,
       currency,
+      hidden,
       costPrice,
       costAmount: round(quantity * costPrice * rate, 2),
       price: costPrice,
@@ -127,6 +132,7 @@ export function addAsset(state, scope, data = {}) {
       ...baseAsset(scope, data),
       code,
       name,
+      hidden,
       price: costPrice,
       priceDate: null,
       prevClose: null,
@@ -153,6 +159,7 @@ export function addAsset(state, scope, data = {}) {
     ...baseAsset(scope, data),
     code,
     name,
+    hidden,
     nav: costPrice,
     navDate: null,
     accNav: null,
@@ -196,7 +203,7 @@ function resetQuoteState(asset, scope, state) {
     asset.accNav = null;
     asset.dailyReturn = null;
   } else {
-    const usdCny = num(state.meta.usdCny, 7.1) || 7.1;
+    const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
     const rate = asset.currency === 'CNY' ? 1 : usdCny;
     asset.price = asset.costPrice;
     asset.priceCny = round(asset.costPrice * rate, 6);
@@ -251,7 +258,7 @@ export function updateAsset(state, scope, id, data = {}) {
   //   基金   —— 总成本是定投累加出来的权威值：显式改成本价才重算，只改份额则保留总成本但同步均价；
   //   加密货币 —— 改数量/成本价/币种都重算。
   //   recalcCost 是给历史脏数据用的一次性修复开关。
-  const usdCny = num(state.meta.usdCny, 7.1) || 7.1;
+  const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
   const rate = asset.currency === 'CNY' ? 1 : usdCny;
   const costFromPrice = () => round(asset.quantity * (scope === 'crypto' ? asset.costPrice * rate : asset.costPrice), 2);
   const explicitCost = data.costAmount !== undefined;
@@ -268,6 +275,12 @@ export function updateAsset(state, scope, id, data = {}) {
   }
 
   if (scope === 'crypto' && data.currency !== undefined) asset.currency = data.currency === 'CNY' ? 'CNY' : 'USD';
+
+  // 屏蔽开关：只翻转 hidden，行情与成本字段一律原样保留（见 setAssetHidden 的说明）
+  if (data.hidden !== undefined) {
+    if (Boolean(data.hidden)) setAssetHidden(state, scope, id, true);
+    else if (asset.hidden) setAssetHidden(state, scope, id, false);
+  }
 
   if (scope === 'fund' && data.dca) {
     asset.dca = { ...asset.dca };
@@ -305,8 +318,7 @@ export function updateAsset(state, scope, id, data = {}) {
  * 只接受合法 id；未出现在 ids 里的记录按原顺序追加到末尾，避免并发新增导致丢数据。
  */
 export function reorderAssets(state, scope, ids = []) {
-  const key = scope === 'stock' ? 'stocks' : scope === 'fund' ? 'funds' : scope === 'crypto' ? 'crypto' : null;
-  if (!key) throw new Error(`未知板块 ${scope}`);
+  const key = scopeKey(scope);
   const list = state[key];
   const byId = new Map(list.map((x) => [x.id, x]));
   const next = [];
@@ -324,9 +336,70 @@ export function reorderAssets(state, scope, ids = []) {
   return next.length;
 }
 
-export function deleteAsset(state, scope, id) {
+/* ---------------------------------------------------------------- 屏蔽 */
+
+/**
+ * 屏蔽 = 「这一项暂时不计入任何合计」，**不是**删除、也不是清空数据。
+ *
+ * 所以这里刻意**不动任何行情字段**：
+ *  - 成本价 / 数量 / 总成本 / 备注 / 定投配置全部原样保留；
+ *  - 上次取到的行情价也一并留着，界面上照样显示（标注成「已屏蔽」），
+ *    这样你一眼能看出这一项现在值多少，只是没算进合计；
+ *  - 更新行情时会跳过它（不取价、不补定投），行情就停在屏蔽那一刻；
+ *  - 取消屏蔽 = 把 hidden 一放回 false，**所有数字立刻回到屏蔽前的样子**，
+ *    不需要重新拉一次行情。
+ *
+ * ⚠️ 早期版本在屏蔽时把这些行情字段清成 null，结果取消屏蔽后成本价 /
+ * 均价都变成 0，必须再点一次「更新行情」才能找回来 —— 用户的反馈是
+ * 「屏蔽了之后把成本价搞没了」。屏蔽不该有任何破坏性。
+ */
+const QUOTE_FIELDS = {
+  stock: ['price', 'priceDate', 'prevClose', 'changePercent', 'lastQuoteDate', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history'],
+  fund: ['nav', 'navDate', 'accNav', 'dailyReturn', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history'],
+  crypto: ['price', 'priceCny', 'priceUsd', 'change24h', 'priceSource', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history'],
+};
+
+/** 该标的当前是否「有行情」——只用于屏蔽时提示「行情停在某天」 */
+const QUOTE_PROBE = {
+  stock: ['price'],
+  fund: ['nav'],
+  crypto: ['priceUsd', 'priceCny'],
+};
+
+function hasQuote(scope, asset) {
+  return (QUOTE_PROBE[scope] || []).some((f) => num(asset[f], 0) > 0);
+}
+
+function scopeKey(scope) {
   const key = scope === 'stock' ? 'stocks' : scope === 'fund' ? 'funds' : scope === 'crypto' ? 'crypto' : null;
   if (!key) throw new Error(`未知板块 ${scope}`);
+  return key;
+}
+
+/** 设置（或取消）屏蔽。行情与成本字段一律原样保留，只翻转 hidden。 */
+export function setAssetHidden(state, scope, id, hidden) {
+  const asset = state[scopeKey(scope)].find((x) => x.id === id);
+  if (!asset) throw new Error('未找到该资产');
+  const next = hidden !== false;
+  if (Boolean(asset.hidden) === next) return asset;
+
+  const frozen = next && hasQuote(scope, asset) ? (asset.lastUpdate || null) : null;
+  asset.hidden = next;
+  // 这里**没有**任何字段被清空 —— 详见上面 QUOTE_FIELDS 处的说明
+  asset.updatedAt = nowStamp();
+  pushLog(state, {
+    scope,
+    kind: 'edit',
+    assetId: asset.id,
+    text: next
+      ? `屏蔽 ${asset.name}${asset.code ? `(${asset.code})` : ''}：不再计入合计，持仓与行情原样冻结${frozen ? `（行情停在 ${frozen}）` : ''}`
+      : `取消屏蔽 ${asset.name}${asset.code ? `(${asset.code})` : ''}：已恢复计入合计，持仓与行情原样还原`,
+  });
+  return asset;
+}
+
+export function deleteAsset(state, scope, id) {
+  const key = scopeKey(scope);
   const idx = state[key].findIndex((x) => x.id === id);
   if (idx < 0) throw new Error('未找到该资产');
   const [asset] = state[key].splice(idx, 1);
@@ -372,12 +445,14 @@ export async function primeAsset(state, scope, asset) {
       } catch {
         /* 拿不到就沿用已有汇率 */
       }
+      const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
       const map = await crypto.getPrices([asset.coinId], { [asset.coinId]: asset.symbol });
       const p = map.get(asset.coinId);
-      if (p?.priceCny) {
-        asset.priceCny = p.priceCny;
+      if (p?.priceUsd) {
+        // 交易所源只给美元价，人民币一律按当次汇率折算，避免两个源口径打架
         asset.priceUsd = p.priceUsd;
-        asset.price = asset.currency === 'CNY' ? p.priceCny : p.priceUsd;
+        asset.priceCny = round(p.priceUsd * usdCny, 6);
+        asset.price = asset.currency === 'CNY' ? asset.priceCny : asset.priceUsd;
         asset.change24h = p.change24h;
         asset.priceSource = p.source;
       }
@@ -400,8 +475,9 @@ export function countAssets(state, scope) {
  * 执行一次更新。
  * @param {object} state
  * @param {'stock'|'fund'|'crypto'} scope
- * @param {{onProgress?: (p:{label?:string, advance?:boolean}) => void}} [options]
+ * @param {{onProgress?: (p:{label?:string, advance?:boolean}) => void, signal?: AbortSignal}} [options]
  *        onProgress 会在每只标的开始前报一次 label，完成后带 advance:true 报一次，供长任务进度条使用
+ *        signal 用于「中止更新」：只在可中断的源（加密货币）上生效，命中时会抛 AbortError
  * @returns {Promise<{scope:string, summary:object, items:Array, errors:Array}>}
  */
 export async function runUpdate(state, scope, options = {}) {
@@ -419,7 +495,7 @@ export async function runUpdate(state, scope, options = {}) {
 
   if (scope === 'stock') await updateStocks(state, report, progress, once);
   else if (scope === 'fund') await updateFunds(state, report, progress, once);
-  else await updateCryptos(state, report, progress);
+  else await updateCryptos(state, report, progress, options);
 
   state.meta.lastUpdate[scope] = today();
   state.meta.quoteAt = nowStamp();
@@ -427,6 +503,7 @@ export async function runUpdate(state, scope, options = {}) {
   report.summary.label = SCOPE_LABEL[scope];
   report.summary.updated = report.items.filter((x) => !x.error).length;
   report.summary.failed = report.errors.length;
+  report.summary.skipped = report.skipped || 0;
   return report;
 }
 
@@ -443,6 +520,12 @@ async function updateStocks(state, report, progress = () => {}, once = async (_k
   let totalValue = 0;
 
   for (const stock of list) {
+    // 屏蔽的标的不再打接口：既省一次请求，也不会因为「屏蔽项没有行情」而在界面上误导用户
+    if (stock.hidden) {
+      report.skipped = (report.skipped || 0) + 1;
+      progress({ advance: true });
+      continue;
+    }
     const item = { id: stock.id, code: stock.code, name: stock.name };
     progress({ label: `正在获取 ${stock.name}（${stock.code}）日线…` });
     try {
@@ -533,6 +616,12 @@ async function updateFunds(state, report, progress = () => {}, once = async (_k,
   let dcaApplied = 0;
 
   for (const fund of list) {
+    // 屏蔽的基金：既不取净值，也不补算定投（份额与定投进度原地冻结）
+    if (fund.hidden) {
+      report.skipped = (report.skipped || 0) + 1;
+      progress({ advance: true });
+      continue;
+    }
     const item = { id: fund.id, code: fund.code, name: fund.name };
     progress({ label: `正在获取 ${fund.name}（${fund.code}）历史净值…` });
     try {
@@ -673,7 +762,8 @@ async function updateFunds(state, report, progress = () => {}, once = async (_k,
 
 /* ----------------------------------------------------------- 加密货币 */
 
-async function updateCryptos(state, report, progress = () => {}) {
+async function updateCryptos(state, report, progress = () => {}, options = {}) {
+  const { signal } = options;
   const list = state.crypto;
   if (!list.length) {
     report.summary.message = '加密货币列表为空，没有需要更新的持仓';
@@ -685,26 +775,38 @@ async function updateCryptos(state, report, progress = () => {}) {
   progress({ label: '正在获取 USD/CNY 汇率…' });
   // 汇率先刷新一次，供成本/市值折算
   try {
-    const rate = await crypto.getUsdCny();
+    const rate = await crypto.getUsdCny({ signal });
     if (rate) {
       state.meta.usdCny = rate;
       state.meta.usdCnyAt = nowStamp();
     }
-  } catch {
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
     /* 沿用旧汇率 */
   }
-  const usdCny = num(state.meta.usdCny, 7.1) || 7.1;
+  const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
 
   const symbols = Object.fromEntries(list.map((x) => [x.coinId, x.symbol]).filter(([, s]) => s));
-  progress({ label: '正在获取加密货币现价…' });
-  const prices = await crypto.getPrices(list.map((x) => x.coinId), symbols);
+  progress({ label: `正在获取 ${list.length} 个币种的现价…` });
+  // 一次拿到全部现价（Binance / Gate.io 都支持批量），拿不到的会在下面按币种报错
+  const prices = await crypto.getPrices(
+    list.map((x) => x.coinId),
+    symbols,
+    { signal },
+  );
+  const failedSource = crypto.sourceStatus().filter((s) => s.cooling);
 
   for (const coin of list) {
+    // 屏蔽的币种不打接口
+    if (coin.hidden) {
+      report.skipped = (report.skipped || 0) + 1;
+      progress({ advance: true });
+      continue;
+    }
     const item = { id: coin.id, coinId: coin.coinId, name: coin.name, symbol: coin.symbol };
-    progress({ label: `正在处理 ${coin.name}（${coin.symbol || coin.coinId}）…` });
     try {
       const p = prices.get(coin.coinId);
-      if (!p || p.priceCny === null) throw new Error('未取到价格（CoinGecko / OKX 均无返回）');
+      if (!p || !(p.priceUsd > 0)) throw new Error('未取到价格（Binance / Gate / OKX / CoinGecko 均无返回）');
 
       const oldPrice = num(coin.price, null);
       const oldDate = coin.lastUpdate;
@@ -720,21 +822,24 @@ async function updateCryptos(state, report, progress = () => {}) {
             t,
             coin.currency === 'CNY' ? 'cny' : 'usd',
             coin.symbol,
+            { signal },
           );
           if (hist.length) {
             coin.baselinePrice = hist[0].price;
             coin.baselineDate = hist[0].date;
             coin.history = mergeHistory(coin.history, hist.map((h) => ({ date: h.date, price: h.price })));
           }
-        } catch {
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
           /* 忽略：不影响现价更新 */
         }
       }
 
-      coin.priceCny = p.priceCny;
+      // 交易所源只报美元价，人民币按当次汇率折算，保证与「成本口径」用的是同一个汇率
       coin.priceUsd = p.priceUsd;
+      coin.priceCny = round(p.priceUsd * usdCny, 6);
       coin.change24h = p.change24h;
-      coin.price = coin.currency === 'CNY' ? p.priceCny : p.priceUsd;
+      coin.price = coin.currency === 'CNY' ? coin.priceCny : coin.priceUsd;
       coin.priceSource = p.source;
       coin.lastUpdate = t;
       coin.history = mergeHistory(coin.history, [{ date: t, price: coin.price }]);
@@ -758,22 +863,31 @@ async function updateCryptos(state, report, progress = () => {}) {
         source: p.source,
       });
       report.items.push(item);
+      progress({ label: `${coin.name}（${coin.symbol || coin.coinId}）${p.source} ✓`, advance: true });
     } catch (err) {
+      if (err?.name === 'AbortError') throw err;
       item.error = err.message || String(err);
       if (coin.baselinePrice) coin.lastUpdate = t;
       report.items.push(item);
       report.errors.push({ id: coin.id, coinId: coin.coinId, name: coin.name, message: item.error });
+      progress({ advance: true });
     }
-    progress({ advance: true });
   }
 
+  const okCount = report.items.filter((i) => !i.error).length;
   pushLog(state, {
     scope: 'crypto',
     kind: 'update',
-    text: `更新加密货币行情：成功 ${report.items.filter((i) => !i.error).length}/${list.length} 个，价格贡献 ${totalChange >= 0 ? '+' : ''}¥${round(totalChange, 2)}，USD/CNY ${usdCny}`,
+    text:
+      `更新加密货币行情：成功 ${okCount}/${list.length} 个，价格贡献 ${totalChange >= 0 ? '+' : ''}¥${round(totalChange, 2)}，USD/CNY ${usdCny}` +
+      (failedSource.length ? `；已熔断的源：${failedSource.map((s) => s.host).join('、')}` : ''),
   });
   report.summary.totalChange = round(totalChange, 2);
   report.summary.usdCny = usdCny;
+  report.sources = crypto.sourceStatus();
+  if (okCount < list.length) {
+    report.summary.message = `成功 ${okCount}/${list.length} 个币种`;
+  }
 }
 
 /* ============================================================ 估值快照 */
@@ -853,19 +967,28 @@ function totalsOf(rows) {
 
 /**
  * 生成前端所需的完整快照（估值、权重、定投待执行天数、日志）
+ *
+ * 「屏蔽」的口径：屏蔽的资产仍然出现在列表里（带标注），但**不参与任何合计** ——
+ * 总市值 / 总成本 / 盈亏 / 权重 / 配置条 / 定投合计，全部只看未屏蔽的部分。
+ * 目的是「这一项先不算，我想看看剩下的组合长什么样」。
+ *
  * @param {object} state
  */
 export async function computeState(state) {
-  const usdCny = num(state.meta.usdCny, 7.1) || 7.1;
+  const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
   const ctx = { usdCny };
 
-  const stocks = state.stocks.map((a) => decorate(a, 'stock', ctx));
-  const funds = state.funds.map((a) => decorate(a, 'fund', ctx));
-  const cryptos = state.crypto.map((a) => decorate(a, 'crypto', ctx));
+  const allStocks = state.stocks.map((a) => decorate(a, 'stock', ctx));
+  const allFunds = state.funds.map((a) => decorate(a, 'fund', ctx));
+  const allCryptos = state.crypto.map((a) => decorate(a, 'crypto', ctx));
 
-  // 定投待执行交易日（今天仍未执行的天数）
+  // 定投待执行交易日（今天仍未执行的天数）—— 屏蔽的基金不参与，也不显示待办
   const t = today();
-  for (const f of funds) {
+  for (const f of allFunds) {
+    if (f.hidden) {
+      f.pendingDays = 0;
+      continue;
+    }
     if (f.dca?.enabled && num(f.dca.amount) > 0) {
       const anchor = f.lastDcaDate || addDays(f.dca.startDate || t, -1);
       const all = await cn.tradingDaysBetween(anchor, t);
@@ -875,65 +998,102 @@ export async function computeState(state) {
     }
   }
 
-  const scopeRows = { stock: stocks, fund: funds, crypto: cryptos };
-  const byScope = {
-    stock: totalsOf(stocks),
-    fund: totalsOf(funds),
-    crypto: totalsOf(cryptos),
+  /** 计算某一套口径下的全部合计；keep 决定某个 scope 的哪些行计入 */
+  const aggregate = (keep) => {
+    const rows = {
+      stock: allStocks.filter((r) => keep(r, 'stock')),
+      fund: allFunds.filter((r) => keep(r, 'fund')),
+      crypto: allCryptos.filter((r) => keep(r, 'crypto')),
+    };
+    const byScope = {
+      stock: totalsOf(rows.stock),
+      fund: totalsOf(rows.fund),
+      crypto: totalsOf(rows.crypto),
+    };
+    // 加密货币额外给一个「原币盈亏」合计，供界面直接显示「赚了多少美元」
+    byScope.crypto.pnlNative = round(
+      rows.crypto.reduce((sum, r) => sum + (Number(r.pnlNative) || 0), 0),
+      4,
+    );
+    byScope.crypto.costNative = round(
+      rows.crypto.reduce((sum, r) => sum + (Number(r.costNative) || 0), 0),
+      4,
+    );
+    const allRows = [...rows.stock, ...rows.fund, ...rows.crypto];
+    return { rows, byScope, allRows, totals: totalsOf(allRows) };
   };
-  // 加密货币额外给一个「原币盈亏」合计，供界面直接显示「赚了多少美元」
-  byScope.crypto.pnlNative = round(
-    cryptos.reduce((sum, r) => sum + (Number(r.pnlNative) || 0), 0),
-    4,
-  );
-  byScope.crypto.costNative = round(
-    cryptos.reduce((sum, r) => sum + (Number(r.costNative) || 0), 0),
-    4,
-  );
-  const allRows = [...stocks, ...funds, ...cryptos];
-  const totals = totalsOf(allRows);
 
+  // 只有一套口径：屏蔽项不计入。accounting 上「屏蔽」就等于把它移出组合，
+  // 但记录与行情都留在盘里可以随时还原 —— 所以不需要第二套「含屏蔽项」的合计。
+  const visible = aggregate((r) => !r.hidden);
+  // 屏蔽项自己的合计（行情冻在屏蔽那一刻），只用于说明「排除掉了多少」，不参与任何主口径
+  const raw = aggregate(() => true);
+  const hiddenRows = {
+    stock: allStocks.filter((r) => r.hidden),
+    fund: allFunds.filter((r) => r.hidden),
+    crypto: allCryptos.filter((r) => r.hidden),
+  };
+
+  const hiddenCount = {
+    stock: hiddenRows.stock.length,
+    fund: hiddenRows.fund.length,
+    crypto: hiddenRows.crypto.length,
+  };
+  hiddenCount.total = hiddenCount.stock + hiddenCount.fund + hiddenCount.crypto;
+
+  const scopeRows = { stock: allStocks, fund: allFunds, crypto: allCryptos };
+  const byScope = visible.byScope;
+  const totals = visible.totals;
+
+  // 权重按「未屏蔽」的总市值归一，读数与账页上的合计一致
   for (const scope of SCOPES) {
     for (const row of scopeRows[scope]) {
       row.weight = totals.marketValue > 0 ? round((row.marketValue / totals.marketValue) * 100, 2) : 0;
     }
   }
 
-  const allocation = allRows
+  const allocation = visible.allRows
     .map((r) => ({
       id: r.id,
       scope: r.scope,
       name: r.name,
       code: r.code || r.symbol || r.coinId,
       note: r.note || '',
+      hidden: Boolean(r.hidden),
       value: r.marketValue,
       weight: r.weight,
     }))
     .sort((a, b) => b.value - a.value);
 
-  const dcaFunds = funds.filter((f) => f.dca?.enabled && num(f.dca.amount) > 0);
+  const dcaFunds = visible.rows.fund.filter((f) => f.dca?.enabled && num(f.dca.amount) > 0);
   const dca = {
     enabledFunds: dcaFunds.length,
     dailyAmount: round(dcaFunds.reduce((s, f) => s + num(f.dca.amount), 0), 2),
-    totalInvested: round(funds.reduce((s, f) => s + num(f.dcaInvested), 0), 2),
-    totalCount: funds.reduce((s, f) => s + num(f.dcaCount), 0),
-    totalUnits: round(funds.reduce((s, f) => s + num(f.dcaUnits), 0), 4),
+    totalInvested: round(visible.rows.fund.reduce((s, f) => s + num(f.dcaInvested), 0), 2),
+    totalCount: visible.rows.fund.reduce((s, f) => s + num(f.dcaCount), 0),
+    totalUnits: round(visible.rows.fund.reduce((s, f) => s + num(f.dcaUnits), 0), 4),
     pendingDays: dcaFunds.reduce((s, f) => s + num(f.pendingDays), 0),
+    hiddenCount: hiddenCount.fund,
   };
 
   return {
     ...state,
-    stocks,
-    funds,
-    crypto: cryptos,
+    stocks: allStocks,
+    funds: allFunds,
+    crypto: allCryptos,
     computed: {
       quoteAt: state.meta.quoteAt,
       usdCny,
       usdCnyAt: state.meta.usdCnyAt,
       totals,
       byScope,
+      /** 「含屏蔽项」的合计（屏蔽项行情冻在屏蔽那一刻）——只用来算「已排除多少」 */
+      byScopeRaw: raw.byScope,
       allocation,
       dca,
+      hiddenCount,
+      /** 被屏蔽的行（按板块分组），供前端「显示屏蔽项」时列出 */
+      hiddenRows,
       logs: [...state.logs].reverse().slice(0, 60),
       dcaLogs: [...state.logs].filter((l) => l.kind === 'dca').reverse().slice(0, 40),
       today: t,

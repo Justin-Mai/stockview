@@ -14,7 +14,7 @@ import { buildDemoState } from './seed.js';
 import * as pf from './portfolio.js';
 import * as cn from './providers/cn.js';
 import * as crypto from './providers/crypto.js';
-import { addAsset, deleteAsset, updateAsset, primeAsset, reorderAssets } from './portfolio.js';
+import { addAsset, deleteAsset, updateAsset, primeAsset, reorderAssets, setAssetHidden } from './portfolio.js';
 import { beginTask, currentTask, endTask, reportProgress } from './tasks.js';
 import { nowStamp } from './util.js';
 
@@ -78,7 +78,45 @@ async function readBody(req) {
 
 /* -------------------------------------------------------------- API 路由 */
 
-/** 统一快照：组合数据 + 服务端信息（数据文件、端口、Node 版本） */
+/** 更新任务的取消令牌：同一时刻只有一个长任务，模块级变量即可 */
+let updateAbort = null;
+
+/**
+ * 把「更新前读到的那份 state」里变化过的行情字段，合并回「刚重新读出来的 state」。
+ *
+ * 为什么要这么绕：更新行情要联网几十秒，早期版本把整个联网过程放在 store 的
+ * mutate() 事务里，而 store 用**一条串行队列**同时串行化读和写 —— 于是更新期间
+ * `GET /api/state` 会被堵住十几秒（前端遮罩上的进度条也因此卡在第 0 步不动）。
+ *
+ * 现在改成：先在事务外读一份快照 → 在快照上跑更新 → 再用一次很短的 mutate
+ * 把结果落盘。合并时只搬「行情/统计」字段，不整对象覆盖；
+ * 用户在更新期间改过的数量、成本、备注因此不会被覆盖掉。
+ */
+const MERGE_FIELDS = {
+  stock: ['price', 'priceDate', 'prevClose', 'changePercent', 'lastQuoteDate', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history'],
+  fund: ['nav', 'navDate', 'accNav', 'dailyReturn', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history', 'quantity', 'costAmount', 'costPrice', 'lastDcaDate', 'dcaCount', 'dcaInvested', 'dcaUnits', 'missedDates'],
+  crypto: ['price', 'priceCny', 'priceUsd', 'change24h', 'priceSource', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history'],
+};
+
+function mergeQuotes(live, source, scope) {
+  const key = scope === 'stock' ? 'stocks' : scope === 'fund' ? 'funds' : 'crypto';
+  const byId = new Map((source[key] || []).map((a) => [a.id, a]));
+  let n = 0;
+  for (const asset of live[key] || []) {
+    const src = byId.get(asset.id);
+    if (!src) continue; // 更新期间被删掉了：保持删除
+    // 更新期间被屏蔽 / 取消屏蔽：以用户最新的选择为准，不要用旧快照覆盖回去
+    if (Boolean(src.hidden) !== Boolean(asset.hidden)) continue;
+    for (const f of MERGE_FIELDS[scope] || []) {
+      if (src[f] === undefined) continue;
+      asset[f] = src[f];
+    }
+    n += 1;
+  }
+  return n;
+}
+
+/** 统一快照：组合数据 + 服务端信息（数据文件、端口、Node 版本、行情源健康度） */
 async function snapshot(state) {
   const snap = await pf.computeState(state);
   snap.computed.server = {
@@ -87,6 +125,8 @@ async function snapshot(state) {
     node: process.version,
     platform: `${process.platform} ${process.arch}`,
     startedAt: STARTED_AT,
+    crypto: crypto.sourceStatus(),
+    fx: crypto.fxStatus(),
   };
   return snap;
 }
@@ -98,7 +138,7 @@ async function handleApi(req, res, url) {
     return ok(res, { alive: true, pid: process.pid, dataFile: paths.DATA_FILE });
   }
 
-  // 完整组合快照
+  // 完整组合快照（屏蔽项不计入任何合计，但仍会出现在列表里并带标注）
   if (req.method === 'GET' && route === '/state') {
     const state = await load();
     return ok(res, { state: await snapshot(state) });
@@ -155,35 +195,84 @@ async function handleApi(req, res, url) {
     return ok(res, { asset: result, state: await snapshot(state), message: `已删除 ${result.name}` });
   }
 
+  // 屏蔽 / 取消屏蔽某项资产（只影响合计口径，不删除、不清空任何数据）
+  if (req.method === 'POST' && route === '/assets/hidden') {
+    const body = await readBody(req);
+    const { scope, id, hidden } = body;
+    const { state, result } = await mutate((s) => setAssetHidden(s, scope, id, hidden !== false));
+    const isHidden = Boolean(result.hidden);
+    return ok(res, {
+      asset: result,
+      state: await snapshot(state),
+      hidden: isHidden,
+      // 屏蔽只是把这一项移出合计，持仓与行情都原样留着，
+      // 所以两个方向都不该提示「去更新行情」——恢复是即时的。
+      message: isHidden
+        ? `已屏蔽 ${result.name}，暂不计入合计（数据原样保留）`
+        : `已恢复 ${result.name}，持仓与行情原样还原`,
+    });
+  }
+
   // 执行更新（股票 / 基金 / 加密货币 / 全部）
   // 与「重建演示数据」一样开一个长任务，前端轮询 /api/task 显示「正在获取 XX 日线…」这类真实进度
+  //
+  // ⚠️ 联网过程**不放在 mutate 事务里**：store 的读写共用一条串行队列，
+  // 早期版本更新 87 秒就把 /api/state 一起堵了 87 秒（遮罩上的进度条卡在第 0 步）。
+  // 现在：事务外读快照 → 在快照上更新 → 一次短事务合并落盘。
   if (req.method === 'POST' && route === '/update') {
     const body = await readBody(req).catch(() => ({}));
     const scope = body.scope || 'all';
     const scopes = scope === 'all' ? ['stock', 'fund', 'crypto'] : [scope];
     const title = scope === 'all' ? '正在更新全部行情' : `正在更新${pf.SCOPE_LABEL[scope] || ''}行情`;
+    if (updateAbort) throw Object.assign(new Error('已有一个更新任务在进行中'), { status: 409 });
 
-    const { state, result } = await mutate(async (s) => {
-      const total = scopes.reduce((n, sc) => n + pf.countAssets(s, sc), 0);
-      let step = 0;
-      beginTask(title, total);
-      const onProgress = (p) => {
-        if (p && p.advance) step += 1;
-        reportProgress({ step, total, label: p?.label });
-      };
-      try {
-        const reports = [];
-        for (const sc of scopes) reports.push(await pf.runUpdate(s, sc, { onProgress }));
-        // 没有资产时总步数为 0，直接标成完成，避免进度条停在 0
-        if (total === 0) reportProgress({ step: 0, total: 0, label: '没有需要更新的持仓' });
-        endTask();
-        return reports;
-      } catch (err) {
-        endTask(err);
-        throw err;
+    const ctrl = new AbortController();
+    updateAbort = ctrl;
+    const draft = await load();
+    const total = scopes.reduce((n, sc) => n + pf.countAssets(draft, sc), 0);
+    let step = 0;
+    beginTask(title, total);
+    const onProgress = (p) => {
+      if (p && p.advance) step += 1;
+      reportProgress({ step, total, label: p?.label });
+    };
+
+    let reports;
+    try {
+      reports = [];
+      for (const sc of scopes) reports.push(await pf.runUpdate(draft, sc, { onProgress, signal: ctrl.signal }));
+      if (total === 0) reportProgress({ step: 0, total: 0, label: '没有需要更新的持仓' });
+      endTask();
+    } catch (err) {
+      endTask(err);
+      // 中止：不落盘，也不推进 lastUpdate —— 下次更新仍以原基准计算
+      if (err?.name === 'AbortError' || ctrl.signal.aborted) {
+        return ok(res, { reports: [], aborted: true, state: await snapshot(await load()), message: '更新已中止' });
       }
+      throw err;
+    } finally {
+      updateAbort = null;
+    }
+
+    const { state } = await mutate((s) => {
+      for (const rep of reports) mergeQuotes(s, draft, rep.scope);
+      for (const sc of scopes) s.meta.lastUpdate[sc] = draft.meta.lastUpdate[sc] ?? s.meta.lastUpdate[sc];
+      s.meta.quoteAt = draft.meta.quoteAt;
+      if (draft.meta.usdCny) {
+        s.meta.usdCny = draft.meta.usdCny;
+        s.meta.usdCnyAt = draft.meta.usdCnyAt;
+      }
+      s.logs = draft.logs; // 更新过程写了多条流水（含定投明细），直接沿用
+      return reports;
     });
-    return ok(res, { reports: result, state: await snapshot(state) });
+    return ok(res, { reports, state: await snapshot(state) });
+  }
+
+  // 中止正在进行的更新（只有加密货币这类可中断的源会立刻生效）
+  if (req.method === 'POST' && route === '/update/cancel') {
+    if (!updateAbort) return ok(res, { cancelled: false, message: '当前没有进行中的更新' });
+    updateAbort.abort(new Error('用户中止'));
+    return ok(res, { cancelled: true, message: '已请求中止更新' });
   }
 
   // 新增资产前预览行情

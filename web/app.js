@@ -156,6 +156,55 @@ function saveSortState() {
   }
 }
 
+/* ------------------------------------------------------------ 屏蔽状态 */
+
+/**
+ * 每个账页是否「把屏蔽项也显示在表格里」。
+ *
+ * 注意这是纯**显示**开关：合计口径与它无关 —— 屏蔽项永远不计入合计。
+ *   - 关闭（默认）：屏蔽项从表格里收起来；
+ *   - 打开：屏蔽项以半透明行显示并标注「已屏蔽」，方便随时恢复。
+ */
+const HIDDEN_STORE_KEY = 'stockview.showHidden';
+const showHidden = { stock: false, fund: false, crypto: false };
+
+function loadShowHidden() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(HIDDEN_STORE_KEY) || '{}');
+    for (const scope of Object.keys(showHidden)) showHidden[scope] = Boolean(saved?.[scope]);
+  } catch {
+    /* 忽略损坏的本地设置 */
+  }
+}
+
+function saveShowHidden() {
+  try {
+    localStorage.setItem(HIDDEN_STORE_KEY, JSON.stringify(showHidden));
+  } catch {
+    /* 隐私模式忽略 */
+  }
+}
+
+/** 当前表格里该板块「计入合计」的行 */
+function visibleRows(scope) {
+  const all = rowsOfScope(scope);
+  return showHidden[scope] ? all : all.filter((r) => !r.hidden);
+}
+
+/**
+ * 合计永远只算「未屏蔽」的部分 —— 屏蔽的语义就是「这项先不算」。
+ *
+ * 这里刻意不提供「含屏蔽项」的口径：屏蔽时行情字段会被清空，
+ * 把这样一行算进合计只会得到「市值 0、亏损 100%」的假数字。
+ */
+function totalsFor() {
+  return S.computed.totals;
+}
+
+function byScopeFor(scope) {
+  return S.computed.byScope[scope];
+}
+
 function sortRows(scope, rows) {
   const s = sortState[scope];
   const field = s && SORT_FIELDS[s.by]?.key;
@@ -220,6 +269,8 @@ function updateBusy(task) {
 
 function hideBusy() {
   $('#busy').hidden = true;
+  const actions = $('#busyActions');
+  if (actions) actions.hidden = true;
   stopBusyPolling();
 }
 
@@ -231,9 +282,11 @@ function stopBusyPolling() {
 }
 
 /** 显示遮罩并轮询服务端真实进度（而不是干转一个圈） */
-async function startBusyPolling(title, firstLabel) {
+async function startBusyPolling(title, firstLabel, { cancelable = false } = {}) {
   stopBusyPolling();
   showBusy(title, firstLabel);
+  const actions = $('#busyActions');
+  if (actions) actions.hidden = !cancelable;
   const poll = async () => {
     try {
       const { task } = await api('/api/task');
@@ -333,8 +386,9 @@ function renderHead() {
 
 function renderOverview() {
   const c = S.computed;
-  const t = c.totals;
+  const t = totalsFor();
   const el = $('#view-overview');
+  const hiddenTotal = c.hiddenCount?.total || 0;
 
   const alloc = c.allocation.filter((a) => a.value > 0);
   const ribbon = alloc.length
@@ -377,7 +431,7 @@ function renderOverview() {
           : '定投已同步'
         : `成本 <b>${fmt.num(b.cost, 0)}</b>`;
     return `<div class="card" data-goto="${key}">
-      <div class="card-head"><b>${meta.title}</b><em>${list.length} 项 · ${t.marketValue > 0 ? ((b.marketValue / t.marketValue) * 100).toFixed(1) : '0.0'}%</em></div>
+      <div class="card-head"><b>${meta.title}</b><em>${list.length - (c.hiddenCount?.[key] || 0)} 项 · ${t.marketValue > 0 ? ((b.marketValue / t.marketValue) * 100).toFixed(1) : '0.0'}%</em></div>
       <div class="card-value">${fmt.money(b.marketValue)}</div>
       <div class="card-foot">
         <span>盈亏 <b class="${fmt.cls(b.pnl)}">${pnlMain}</b> · <b class="${fmt.cls(b.pnl)}">${fmt.pct(b.pnlPct)}</b></span>
@@ -398,6 +452,7 @@ function renderOverview() {
           <div class="stat"><span>总成本</span><b>${fmt.money(t.cost)}</b></div>
           <div class="stat"><span>累计盈亏</span><b class="${fmt.cls(t.pnl)}">${fmt.signed(t.pnl)}</b><small class="${fmt.cls(t.pnl)}">${fmt.pct(t.pnlPct)}</small></div>
           <div class="stat"><span>持仓标的</span><b>${t.count}</b></div>
+          ${hiddenTotal ? `<div class="stat"><span>已屏蔽</span><b class="dim">${hiddenTotal}</b><small class="dim">不计入上方合计</small></div>` : ''}
         </div>
       </div>
       <div class="hero-side">
@@ -487,18 +542,19 @@ function sortBar(scope) {
 }
 
 function panelStats(key) {
-  const b = S.computed.byScope[key];
+  const b = byScopeFor(key);
   const lu = S.meta.lastUpdate[key];
-  const rows = key === 'stock' ? S.stocks : key === 'fund' ? S.funds : S.crypto;
+  const hiddenCount = S.computed.hiddenCount?.[key] || 0;
   const items = [
     ['市值', fmt.money(b.marketValue)],
     ['成本', fmt.money(b.cost)],
     ['浮动盈亏', `<span class="${fmt.cls(b.pnl)}">${fmt.signedMoney(b.pnl, '¥')}</span> / <span class="${fmt.cls(b.pnlPct)}">${fmt.pct(b.pnlPct)}</span>`],
   ];
   if (key === 'fund') {
-    items.push(['日定投合计', fmt.money(S.computed.dca.dailyAmount)]);
-    items.push(['待执行交易日', S.computed.dca.pendingDays > 0 ? `<span style="color:var(--gold)">${S.computed.dca.pendingDays} 天</span>` : '已同步']);
-    items.push(['累计定投', `${S.computed.dca.totalCount} 笔 · ${fmt.money(S.computed.dca.totalInvested)}`]);
+    const scopeDca = S.computed.dca;
+    items.push(['日定投合计', fmt.money(scopeDca.dailyAmount)]);
+    items.push(['待执行交易日', scopeDca.pendingDays > 0 ? `<span style="color:var(--gold)">${scopeDca.pendingDays} 天</span>` : '已同步']);
+    items.push(['累计定投', `${scopeDca.totalCount} 笔 · ${fmt.money(scopeDca.totalInvested)}`]);
   } else if (key === 'crypto') {
     // 加密货币以原币（美元）表达盈亏，人民币是按实时汇率折算的参考值
     const rateStr = Number(S.computed.usdCny).toFixed(4);
@@ -513,16 +569,77 @@ function panelStats(key) {
   } else {
     items.push(['自上次更新', `<span class="${fmt.cls(b.sinceValueCny)}">${fmt.signed(b.sinceValueCny)}</span>`]);
   }
+  if (hiddenCount) {
+    items.push([
+      '屏蔽项',
+      `<span class="dim">${hiddenCount} 项 · 未计入</span>`,
+    ]);
+  }
   items.push(['上次更新', fmt.date(lu)]);
   return items.map(([k, v]) => `<div class="pstat"><span>${k}</span><b>${v}</b></div>`).join('');
+}
+
+/**
+ * 「屏蔽条」：账页顶部说明当前合计口径：
+ *   - 有屏蔽项时给出「屏蔽后的整体内容」与一键显示 / 收起；
+ *   - 没有屏蔽项时给出一句口径说明与合计市值，保持视觉一致。
+ */
+function hiddenBar(key) {
+  const c = S.computed;
+  const count = c.hiddenCount?.[key] || 0;
+  const showing = showHidden[key];
+  const scopeTotals = c.byScope[key];
+  // 被屏蔽项自己的合计（行情冻在屏蔽那一刻），用于说明「排除掉了多少」
+  const raw = c.byScopeRaw?.[key] || scopeTotals;
+
+  if (!count) {
+    return `<div class="hidden-bar quiet">
+      <div class="hb-main">
+        <b>整体内容</b>
+        <span>未屏蔽任何${SCOPE_META[key].title} · 市值 <b>${fmt.money(scopeTotals.marketValue)}</b> · 盈亏 <b class="${fmt.cls(scopeTotals.pnl)}">${fmt.signedMoney(scopeTotals.pnl, '¥')}</b>（${fmt.pct(scopeTotals.pnlPct)}）</span>
+      </div>
+    </div>`;
+  }
+
+  const excludedValue = Math.max(0, raw.marketValue - scopeTotals.marketValue);
+  return `<div class="hidden-bar${showing ? ' showing' : ''}">
+    <div class="hb-main">
+      <b>${count} 项已屏蔽${showing ? '（下方列出，仍不计入合计）' : ''}</b>
+      <span>整体内容（不含屏蔽项）：市值 <b>${fmt.money(scopeTotals.marketValue)}</b> · 成本 <b>${fmt.money(scopeTotals.cost)}</b> · 盈亏 <b class="${fmt.cls(scopeTotals.pnl)}">${fmt.signedMoney(scopeTotals.pnl, '¥')}</b>（${fmt.pct(scopeTotals.pnlPct)}）
+      · 已排除 <b>${fmt.money(excludedValue)}</b>（成本 ${fmt.money(raw.cost - scopeTotals.cost)}）
+      <br><span class="dim">屏蔽不会删数据：持仓、成本、行情都原样留着，只是暂不计入合计；点「取消屏蔽」立刻还原。</span></span>
+    </div>
+    <button class="btn-ghost hb-btn" data-togglehidden="${key}">${showing ? '收起屏蔽项' : '显示屏蔽项'}</button>
+  </div>`;
 }
 
 /** 标的一栏：名称 + 账户备注徽标 + 代码。同代码多条时，账户是唯一能区分的信息 */
 function whoCell(r, code) {
   return `<div class="who">
-      <div class="who-top"><b>${esc(r.name)}</b>${r.note ? `<em class="acct" title="账户 / 备注">${esc(r.note)}</em>` : ''}</div>
+      <div class="who-top"><b>${esc(r.name)}</b>${r.note ? `<em class="acct" title="账户 / 备注">${esc(r.note)}</em>` : ''}${r.hidden ? '<em class="acct hidden-tag" title="已屏蔽，不计入任何合计">已屏蔽</em>' : ''}</div>
       <span>${code}</span>
     </div>`;
+}
+
+/**
+ * 屏蔽行**照常显示真实数字**，只是整行压暗并标注「已屏蔽」。
+ *
+ * 数据并没有被丢掉：屏蔽期间行情只是"冻住"（更新行情会跳过它），
+ * 所以这里显示的是屏蔽那一刻的价格 / 成本 / 盈亏 —— 你能一眼看出这一项现在值多少，
+ * 只是它没算进合计。取消屏蔽后数字原样回到合计里，不需要重新拉行情。
+ *
+ * 早期版本把这些单元格换成「—」，看起来像数据被删了；用户的反馈是
+ * 「屏蔽了之后把成本价搞没了」。
+ */
+const dimIfHidden = (r) => (r.hidden ? 'dim' : '');
+
+/** 每行末尾的操作区：屏蔽 / 取消屏蔽 + 修改 + 删除 */
+function rowActions(r) {
+  const fix = r.costMismatch ? `<button class="linky" data-fixcost="${esc(r.id)}">修正成本</button>` : '';
+  const hide = r.hidden
+    ? `<button class="linky" data-unhide="${esc(r.id)}">取消屏蔽</button>`
+    : `<button class="linky" data-hide="${esc(r.id)}">屏蔽</button>`;
+  return `<div class="row-actions">${fix}${hide}<button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div>`;
 }
 
 function rowStock(r) {
@@ -535,14 +652,14 @@ function rowStock(r) {
     <td class="l">${whoCell(r, esc(r.code))}</td>
     <td>${fmt.qty(r.quantity)}</td>
     <td>${fmt.price(r.avgCost, dp)}${flag}</td>
-    <td><b>${fmt.price(r.price, dp)}</b></td>
-    <td class="${fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
-    <td>${fmt.money(r.marketValue)}</td>
-    <td class="${fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
-    <td class="${fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td class="${fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 3)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
+    <td class="${dimIfHidden(r)}"><b>${fmt.price(r.price, dp)}</b></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
+    <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 3)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
-    <td class="l"><div class="row-actions">${r.costMismatch ? `<button class="linky" data-fixcost="${esc(r.id)}">修正成本</button>` : ''}<button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div></td>
+    <td class="l">${rowActions(r)}</td>
   </tr>`;
 }
 
@@ -552,38 +669,41 @@ function rowFund(r) {
     ? `<span class="badge on">¥${fmt.num(r.dca.amount, 0)}/日</span>`
     : '<span class="badge">未开启</span>';
   const pending = r.pendingDays > 0 ? `<span class="badge wait">待 ${r.pendingDays} 日</span>` : '';
+  // 屏蔽期间不补算定投，所以这里标注「定投暂停」而不是假装已同步
+  const dcaNow = r.hidden ? `${dcaCell}<br><span class="badge">定投暂停</span>` : `${dcaCell}<br>${pending}`;
   return `<tr data-id="${esc(r.id)}">
     ${GRIP}
     <td class="l">${whoCell(r, `${esc(r.code)}${dcaOn && r.lastDcaDate ? ` · 上次定投 ${esc(r.lastDcaDate)}` : ''}`)}</td>
     <td>${fmt.qty(r.quantity)}</td>
     <td>${fmt.cost(r.avgCost)}</td>
-    <td><b>${fmt.price(r.nav)}</b><br><span style="font-size:11px" class="dim">${esc(fmt.date(r.navDate))}</span></td>
-    <td class="${fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
-    <td>${fmt.money(r.marketValue)}</td>
-    <td class="${fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
-    <td class="${fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td>${dcaCell}<br>${pending}</td>
+    <td class="${dimIfHidden(r)}"><b>${fmt.price(r.nav)}</b><br><span style="font-size:11px" class="dim">${esc(fmt.date(r.navDate))}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
+    <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
+    <td>${dcaNow}</td>
     <td>${r.dcaCount > 0 ? `${r.dcaCount} 笔<br><span style="font-size:11px" class="dim">${fmt.money(r.dcaInvested)} · ${fmt.qty(r.dcaUnits)} 份</span>` : '<span class="dim">—</span>'}</td>
-    <td class="${fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 4)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 4)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
-    <td class="l"><div class="row-actions"><button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div></td>
+    <td class="l">${rowActions(r)}</td>
   </tr>`;
 }
 
 function rowCrypto(r) {
   const cur = r.currency === 'CNY' ? '¥' : '$';
+  const src = { binance: 'Binance', gate: 'Gate.io', okx: 'OKX', coingecko: 'CoinGecko' }[r.priceSource] || r.priceSource;
   return `<tr data-id="${esc(r.id)}">
     ${GRIP}
-    <td class="l">${whoCell(r, `${esc(r.symbol)} · ${esc(r.coinId)}${r.priceSource === 'okx' ? ' · <i class="flag">OKX</i>' : ''}`)}</td>
+    <td class="l">${whoCell(r, `${esc(r.symbol)} · ${esc(r.coinId)}${src ? ` · <i class="flag">${esc(src)}</i>` : ''}`)}</td>
     <td>${fmt.cryptoQty(r.quantity)}</td>
     <td>${cur}${fmt.price(r.costPrice, 2)}</td>
-    <td><b>${cur}${fmt.price(r.nativePrice, 2)}</b>${r.currency === 'USD' && r.priceCny ? `<br><span style="font-size:11px" class="dim">¥${fmt.price(r.priceCny, 2)}</span>` : ''}</td>
-    <td class="${fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
-    <td>${fmt.money(r.marketValue)}</td>
-    <td class="${fmt.cls(r.pnlNative)}"><b>${fmt.signedMoney(r.pnlNative, cur)}</b><br><span style="font-size:11px" class="dim">${fmt.signedMoney(r.pnl, '¥')}</span></td>
-    <td class="${fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td class="${fmt.cls(r.sinceChange)}">${cur}${fmt.signed(r.sinceChange, 2)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
-    <td class="l"><div class="row-actions"><button class="linky" data-edit="${esc(r.id)}">修改</button><button class="linky danger" data-del="${esc(r.id)}">删除</button></div></td>
+    <td class="${dimIfHidden(r)}"><b>${cur}${fmt.price(r.nativePrice, 2)}</b>${r.currency === 'USD' && r.priceCny ? `<br><span style="font-size:11px" class="dim">¥${fmt.price(r.priceCny, 2)}</span>` : ''}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
+    <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlNative)}"><b>${fmt.signedMoney(r.pnlNative, cur)}</b><br><span style="font-size:11px" class="dim">${fmt.signedMoney(r.pnl, '¥')}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${cur}${fmt.signed(r.sinceChange, 2)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
+    <td class="l">${rowActions(r)}</td>
   </tr>`;
 }
 
@@ -591,33 +711,46 @@ const ROW_FN = { stock: rowStock, fund: rowFund, crypto: rowCrypto };
 
 function renderTable(key) {
   const all = rowsOfScope(key);
-  const rows = sortRows(key, all);
+  const hiddenRows = all.filter((r) => r.hidden);
+  const rows = sortRows(key, visibleRows(key));
   const manual = sortState[key].by === 'manual';
   const prefix =
     key === 'stock'
       ? '每行记录一只股票的持股与成本；「自上次更新」按上次更新时保存的价格计算变化。同一代码可以有多条，用「账户 / 备注」区分。'
       : key === 'fund'
         ? '日定投在每次「更新净值」时，按 (上次定投日, 最新净值日] 之间每一个交易日的净值折算份额。'
-        : '加密货币以 CoinGecko 计价（失败自动切 OKX）；成本按「计价货币」计入。';
+        : '加密货币价格依次尝试 Binance → Gate.io → OKX → CoinGecko，成功的来源会标在标的下面；成本按「计价货币」计入。';
   const cols = COLUMNS[key].map((c) => `<th class="${c.cls || ''}">${c.k}</th>`).join('');
 
   const body = rows.length
-    ? rows.map((r, i) => ROW_FN[key](r).replace('<tr ', `<tr style="animation-delay:${Math.min(i * 28, 420)}ms" `)).join('')
+    ? rows
+        .map((r, i) =>
+          ROW_FN[key](r)
+            .replace('<tr ', `<tr class="${r.hidden ? 'row-hidden' : ''}" style="animation-delay:${Math.min(i * 28, 420)}ms" `),
+        )
+        .join('')
     : '';
+
+  const hint = hiddenRows.length && !showHidden[key]
+    ? `另有 <b>${hiddenRows.length}</b> 项已屏蔽（不计入合计，<b>数据都还在</b>），点上方「显示屏蔽项」查看。`
+    : manual
+      ? '当前为自定义顺序，<b>按住行首的 ⠿ 可拖动调整</b>。'
+      : '当前为排序视图，切回「自定义」才能拖动。';
 
   return `
     <section class="panel">
+      ${hiddenBar(key)}
       <div class="panel-head">
         <div class="panel-stats">${panelStats(key)}</div>
         <div class="head-tools">${sortBar(key)}<button class="btn-ghost" data-add="${key}">+ 添加${SCOPE_META[key].title}</button></div>
       </div>
-      <p class="dim" style="font-size:12px;margin:-6px 0 16px;max-width:860px">${prefix}${manual ? '当前为自定义顺序，<b>按住行首的 ⠿ 可拖动调整</b>。' : '当前为排序视图，切回「自定义」才能拖动。'}</p>
+      <p class="dim" style="font-size:12px;margin:-6px 0 16px;max-width:880px">${prefix}${hint}</p>
       <div class="table-wrap${manual ? ' manual' : ' sorted'}">
         <table>
           <thead><tr>${cols}</tr></thead>
           <tbody>${body}</tbody>
         </table>
-        ${rows.length ? '' : `<div class="empty"><div class="seal-ghost">空</div><p>还没有${SCOPE_META[key].title}记录</p><p class="small">点击右上角「+ 添加${SCOPE_META[key].title}」开始记账</p></div>`}
+        ${rows.length ? '' : `<div class="empty"><div class="seal-ghost">空</div><p>${hiddenRows.length ? `全部 ${hiddenRows.length} 项都被屏蔽了` : `还没有${SCOPE_META[key].title}记录`}</p><p class="small">${hiddenRows.length ? '点上方「显示屏蔽项」，或在行末点「取消屏蔽」' : `点击右上角「+ 添加${SCOPE_META[key].title}」开始记账`}</p></div>`}
       </div>
     </section>`;
 }
@@ -917,6 +1050,9 @@ function render() {
     view.querySelectorAll('[data-add]').forEach((b) => b.addEventListener('click', () => openDrawer(b.dataset.add)));
     view.querySelectorAll('[data-fixcost]').forEach((b) => b.addEventListener('click', () => fixCost(tab, b.dataset.fixcost)));
     view.querySelectorAll('[data-sort]').forEach((b) => b.addEventListener('click', () => changeSort(tab, b.dataset.sort)));
+    view.querySelectorAll('[data-hide]').forEach((b) => b.addEventListener('click', () => toggleHidden(tab, b.dataset.hide, true)));
+    view.querySelectorAll('[data-unhide]').forEach((b) => b.addEventListener('click', () => toggleHidden(tab, b.dataset.unhide, false)));
+    view.querySelectorAll('[data-togglehidden]').forEach((b) => b.addEventListener('click', () => toggleHiddenView(b.dataset.togglehidden)));
     wireDrag(view, tab);
   }
 
@@ -938,6 +1074,62 @@ function render() {
 function applyState(next) {
   S = next;
   render();
+}
+
+/**
+ * 重新拉一次快照。
+ * 合计口径（是否含屏蔽项）由服务端算，所以切换「显示屏蔽项」时必须重新取数，
+ * 不能只在前端过滤表格 —— 否则表头合计会与看到的行对不上。
+ */
+async function refreshState({ quiet = false } = {}) {
+  try {
+    const { state } = await api('/api/state');
+    applyState(state);
+  } catch (err) {
+    if (!quiet) toast('刷新失败', [err.message], 'err');
+  }
+}
+
+/** 「显示屏蔽项 / 收起」：只影响显示与合计口径，不改变任何记录 */
+function toggleHiddenView(scope) {
+  showHidden[scope] = !showHidden[scope];
+  saveShowHidden();
+  // 立刻按新口径重绘（用服务端已经算好的两套合计），随后再取一次数校准
+  render();
+  refreshState({ quiet: true });
+}
+
+/**
+ * 屏蔽 / 取消屏蔽一项资产。
+ * 屏蔽后该行仍然留着（可在「显示屏蔽项」里看到并恢复），但行情被冻结、不计入任何合计。
+ */
+async function toggleHidden(scope, id, hide) {
+  const asset = rowsOfScope(scope).find((x) => x.id === id);
+  if (!asset) return;
+  if (hide) {
+    const ok = window.confirm(
+      `屏蔽「${asset.name}」？\n\n` +
+        `· 它不再计入总市值 / 成本 / 盈亏 / 权重等任何合计；\n` +
+        `· 记录、持仓、成本、行情**原样保留**，不会丢任何数据；\n` +
+        `· 更新行情时会跳过它（不取价、不补定投），行情就停在现在这一刻；\n` +
+        `· 随时点「取消屏蔽」立刻还原，不需要重新拉行情。`,
+    );
+    if (!ok) return;
+  }
+  try {
+    const res = await api('/api/assets/hidden', { method: 'POST', body: { scope, id, hidden: hide } });
+    applyState(res.state);
+    toast(
+      res.message,
+      hide
+        ? ['数据原样保留，只是暂不计入合计', '更新行情会跳过它，行情停在当前这一刻']
+        : ['持仓、成本、行情原样还原，无需重新更新'],
+      hide ? 'warn' : 'ok',
+      5600,
+    );
+  } catch (err) {
+    toast(hide ? '屏蔽失败' : '恢复失败', [err.message], 'err');
+  }
 }
 
 function switchTab(next) {
@@ -1081,6 +1273,14 @@ function openDrawer(scope, id = null) {
     placeholder: '例如：华泰证券 / 币安 / 招行',
     hint: '同一个代码可以添加多条（例如同一只股票放在不同券商），用这里区分；<b>同代码 + 同备注</b>会被视为重复而拒绝。',
   });
+
+  // 屏蔽：记录留着，但不参与任何合计。放在表单最后，因为它影响的是「汇总」而不是「持有」
+  html += `<div class="field" style="border-top:1px solid var(--line);padding-top:20px">
+    <label>屏蔽这一项</label>
+    <label class="switch"><input type="checkbox" name="hidden" ${asset?.hidden ? 'checked' : ''}/><span class="track"></span><b>${asset?.hidden ? '已屏蔽，不计入合计' : '正常计入合计'}</b></label>
+    <span class="hint">屏蔽后：账页里仍保留这条记录，<b>持仓 / 成本 / 行情原样保留</b>，只是不再计入总市值、成本、盈亏、权重；更新行情时会跳过它（行情停在屏蔽那一刻）。随时关掉这个开关就立刻还原，<b>不需要重新拉行情</b>。</span>
+  </div>`;
+
   html += `<div class="preview" id="preview"><div class="pr"><span>参考行情</span><b>填写代码后自动获取</b></div></div>`;
 
   form.innerHTML = html;
@@ -1244,6 +1444,10 @@ function updatePreview(scope, asset) {
   const codeNow = String(v.code || '').trim();
   const codeSwitched = Boolean(asset && codeNow && codeNow !== originalCode);
 
+  if (asset?.hidden) {
+    rows.push(['当前状态', '已屏蔽 · 不计入合计（持仓与行情原样保留）']);
+  }
+
   if (asset?.costMismatch) {
     rows.push(['成本数据异常', `总成本 ${fmt.money(asset.cost)} 与 数量×成本价 ${fmt.money(asset.expectedCost)} 不一致，保存后会自动修正`]);
   }
@@ -1327,6 +1531,8 @@ async function submitDrawer() {
       if (data.quantity !== undefined) data.quantity = Number(data.quantity);
       if (data.costPrice !== undefined) data.costPrice = Number(data.costPrice);
       if (data.costAmount !== undefined) data.costAmount = Number(data.costAmount);
+      // checkbox 收集出来是布尔值，需要与初始值比较后转成服务端认识的布尔
+      if (data.hidden !== undefined) data.hidden = Boolean(data.hidden);
       // 打开时成本就已脱节的记录：保存时顺手修正，用户不必知道要改哪个字段
       const cur = (scope === 'stock' ? S.stocks : scope === 'fund' ? S.funds : S.crypto).find((x) => x.id === drawer.id);
       if (cur?.costMismatch) data.recalcCost = true;
@@ -1394,21 +1600,29 @@ async function removeAsset(scope, id) {
 
 /* ============================================================ 更新行情 */
 
+/** 实时重算的可见/屏蔽划分：屏蔽项不进合计，但仍在表里可见（可标注、可恢复） */
+function partition(scope) {
+  const all = rowsOfScope(scope);
+  return { visible: all.filter((r) => !r.hidden), hidden: all.filter((r) => r.hidden), all };
+}
+
 async function runUpdate(scope) {
   const btn = $('#btnUpdate');
   if (btn.disabled) return;
   btn.disabled = true;
   btn.classList.add('busy');
+  btn.setAttribute('aria-busy', 'true');
   const t0 = Date.now();
 
-  // 与「重建演示」同一套遮罩 + 真实进度；延迟 350ms 才弹，
-  // 免得只有一两只标的、半秒就结束时闪一下反而碍眼
+  // 与「重建演示」同一套遮罩 + 真实进度。
+  // 这里不加延迟：服务端的更新过程已经不再占着数据锁，遮罩一出现就能拿到真实进度，
+  // 而且能给用户一个「中止更新」的出口。
   const title = scope === 'all' ? '正在更新全部行情' : `正在更新${SCOPE_META[scope]?.title || ''}行情`;
-  const overlayTimer = setTimeout(() => startBusyPolling(title, '正在连接行情源…'), 350);
+  const overlayPromise = startBusyPolling(title, '正在连接行情源…', { cancelable: true });
 
   try {
     const res = await api('/api/update', { method: 'POST', body: { scope } });
-    clearTimeout(overlayTimer);
+    await overlayPromise;
     hideBusy();
     const reports = res.reports || [];
 
@@ -1424,37 +1638,72 @@ async function runUpdate(scope) {
     render();
 
     const allErrors = reports.flatMap((r) => r.errors || []);
+    if (res.aborted) {
+      toast('更新已中止', ['行情与「上次更新」基准都没有变化，可以稍后重试'], 'warn', 6000);
+      return;
+    }
     for (const rep of reports) {
       const lines = [];
       const label = SCOPE_META[rep.scope]?.title || rep.scope;
       if (rep.summary?.message) lines.push(rep.summary.message);
-      else {
-        lines.push(`成功 ${rep.summary.updated} 项${rep.summary.failed ? ` · 失败 ${rep.summary.failed} 项` : ''}`);
-        if (rep.summary.totalChange !== undefined) {
-          lines.push(`价格贡献 ${fmt.signed(rep.summary.totalChange)}`);
-        }
-        if (rep.summary.dca) {
-          const d = rep.summary.dca;
-          lines.push(d.applied > 0 ? `定投补算 ${d.applied} 个交易日 · 投入 ${fmt.money(d.amount)} · 新增 ${fmt.qty(d.units)} 份` : '定投：无待补算交易日');
-        }
+      if (rep.summary?.updated !== undefined) {
+        lines.push(
+          `成功 ${rep.summary.updated} 项` +
+            (rep.summary.failed ? ` · 失败 ${rep.summary.failed} 项` : '') +
+            (rep.summary.skipped ? ` · 已屏蔽跳过 ${rep.summary.skipped} 项` : ''),
+        );
+      }
+      if (rep.summary?.totalChange !== undefined) {
+        lines.push(`价格贡献 ${fmt.signed(rep.summary.totalChange)}`);
+      }
+      if (rep.summary?.dca) {
+        const d = rep.summary.dca;
+        lines.push(d.applied > 0 ? `定投补算 ${d.applied} 个交易日 · 投入 ${fmt.money(d.amount)} · 新增 ${fmt.qty(d.units)} 份` : '定投：无待补算交易日');
+      }
+      for (const src of rep.sources || []) {
+        if (src.cooling) lines.push(`${src.host} 已熔断，${Math.ceil(src.resumeInMs / 1000)} 秒后重试（${src.reason || '不可用'}）`);
       }
       const dcaItems = (rep.items || []).filter((it) => it.dca?.applied > 0);
       for (const it of dcaItems.slice(0, 3)) {
         const last = it.dca.dates.slice(-3).map((d) => `${d.date} ¥${d.amount}÷${d.nav}=+${d.units}份`);
         lines.push(`${it.name}: ${last.join(' / ')}`);
       }
+      const sources = [...new Set((rep.items || []).filter((it) => it.source).map((it) => it.source))];
+      if (sources.length) lines.push(`价格来源：${sources.join(' / ')}`);
       toast(`${label}更新完成 · ${((Date.now() - t0) / 1000).toFixed(1)}s`, lines, allErrors.length ? 'warn' : 'ok', 7600);
     }
     if (allErrors.length) {
       toast('部分标的更新失败', allErrors.slice(0, 5).map((e) => `${e.name}: ${e.message}`), 'err', 9000);
     }
   } catch (err) {
-    clearTimeout(overlayTimer);
+    await overlayPromise.catch(() => {});
     hideBusy();
     toast('更新失败', [err.message], 'err');
   } finally {
     btn.disabled = false;
     btn.classList.remove('busy');
+    btn.removeAttribute('aria-busy');
+  }
+}
+
+/** 中止更新：服务端只在加密货币这类可中断的源上立刻生效 */
+async function cancelUpdate() {
+  const btn = $('#busyCancel');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '正在中止…';
+  }
+  try {
+    await api('/api/update/cancel', { method: 'POST' });
+  } catch {
+    /* 没赶上也无所谓，更新结束时遮罩会自己收起来 */
+  } finally {
+    setTimeout(() => {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '中止更新';
+      }
+    }, 1500);
   }
 }
 
@@ -1463,8 +1712,10 @@ async function runUpdate(scope) {
 async function boot() {
   initContrast();
   loadSortState();
+  loadShowHidden();
   $$('.nav-item').forEach((n) => n.addEventListener('click', () => switchTab(n.dataset.tab)));
   $('#btnUpdate').addEventListener('click', () => runUpdate(tab === 'overview' ? 'all' : tab));
+  $('#busyCancel').addEventListener('click', cancelUpdate);
   $('#drawerClose').addEventListener('click', closeDrawer);
   $('#drawerCancel').addEventListener('click', closeDrawer);
   $('#backdrop').addEventListener('click', closeDrawer);
