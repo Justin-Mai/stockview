@@ -424,10 +424,33 @@ tbody td .sub.dim { color: var(--paper-3); opacity: 1; }
 .badge.on { color: var(--gold); border-color: rgba(216, 173, 51, .5); background: rgba(216, 173, 51, .1); }
 .badge.wait { color: var(--seal-2); border-color: rgba(255, 114, 85, .45); background: rgba(232, 69, 44, .08); }
 
-.spark { display: block; width: 90px; height: 26px; overflow: visible; }
+/*
+ * 迷你走势图。
+ *
+ * 三个坑，都踩过：
+ *  1. 端点由 sparkline() 内缩 1px，所以这里**不要**再写 overflow: visible ——
+ *     那会让描边画到盒子外面，压到相邻列的边缘。
+ *  2. `display: block` 的元素**不受** `td` 的 `text-align: right` 影响，
+ *     于是「走势」表头右对齐、图却停在左边 —— 实测右边缘差 34px，
+ *     这正是用户截图里圈出来的「没对齐」。加 `margin-left: auto` 让它贴右。
+ *  3. `line-height: 0` 避免行高把 inline 盒撑出一两个像素的偏移。
+ */
+.spark { display: block; width: 90px; height: 26px; margin-left: auto; line-height: 0; }
 .spark path { fill: none; stroke-width: 1.4; vector-effect: non-scaling-stroke; }
 
-.row-actions { display: flex; gap: 12px; justify-content: flex-end; opacity: 0; transition: opacity .25s; }
+/*
+ * 行尾操作区（屏蔽 / 取消屏蔽 / 修正成本 / 修改 / 删除）。
+ *
+ * 按钮贴单元格右边缘（flex-end），所以表头「操作」也必须是右对齐 ——
+ * 它原来是 left（沿用了「标的」列的 .l 类），于是表头文字在左、按钮在右，
+ * 实测差了 95px，看起来就是「操作没对齐」。
+ * 现在 th 去掉 .l、按钮保持 flex-end，两头都收在同一个右边缘上。
+ *
+ * 另外给容器加 width: fit-content 并禁止换行：这个 td 宽 146px，
+ * 三个按钮横排约 96px，若不收窄容器，flex 的 align-content 会把它
+ * 当成多行容器拉伸，导致行高不一致。
+ */
+.row-actions { display: flex; flex-wrap: nowrap; gap: 12px; justify-content: flex-end; width: fit-content; margin-left: auto; opacity: 0; transition: opacity .25s; }
 tbody tr:hover .row-actions { opacity: 1; }
 
 /* ------------------------------------------------------------ 排序与拖动 */

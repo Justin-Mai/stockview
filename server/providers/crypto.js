@@ -116,12 +116,21 @@ const HOST_MIN_INTERVAL = 250; // ms，公开接口给得很宽，这里只用�
  * ⚠️ 这里必须自己兜住异常：早期版本是全局单链 `chain = chain.then(fn)`，
  * 只要有一个请求抛错，整条链就变成 rejected 状态且永远不会恢复 ——
  * 之后**每一次** `await throttle()` 都会立刻抛错，加密货币行情从此彻底失效。
+ *
+ * @param {string} host 源标识
+ * @param {() => Promise<any>} task 真正要执行的事
+ * @param {AbortSignal} [signal] 中止信号：排队期间被中止就不再发请求
  */
-function withHostLock(host, task) {
+function withHostLock(host, task, signal) {
   const prev = hostChain.get(host) || Promise.resolve();
   const run = prev.then(async () => {
+    // 排队期间可能已经被中止：这时**不要**再发请求，直接以中止结束。
+    // 少了这一步，「中止更新」对排在队列后面的请求完全无效 ——
+    // 用户点了停止，后面的请求还会一个接一个发完。
+    if (signal?.aborted) throw abortError();
     const wait = HOST_MIN_INTERVAL - (Date.now() - (hostLast.get(host) || 0));
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    if (signal?.aborted) throw abortError();
     hostLast.set(host, Date.now());
     return task();
   });
@@ -146,8 +155,20 @@ function hostOf(url) {
   }
 }
 
+/** 统一的中止错误：调用方靠 err.name === 'AbortError' 判断「是用户点了停止」而非取价失败 */
+export function abortError(reason = '用户中止') {
+  const err = new Error(reason);
+  err.name = 'AbortError';
+  return err;
+}
+
 function aborted(err, signal) {
   return err?.name === 'AbortError' || signal?.aborted;
+}
+
+/** 中止信号已触发就直接抛 AbortError —— 在每个循环开头以及每个 await 之后调用 */
+export function throwIfAborted(signal, reason) {
+  if (signal?.aborted) throw abortError(reason);
 }
 
 /** 带超时 + 外部中止信号的 GET，返回已解析的 JSON */
@@ -155,7 +176,7 @@ async function httpJson(url, { timeout = TIMEOUT, signal, headers } = {}) {
   const ctrl = new AbortController();
   const onAbort = () => ctrl.abort(signal?.reason);
   if (signal) {
-    if (signal.aborted) throw signal.reason || new Error('已中止');
+    if (signal.aborted) throw abortError();
     signal.addEventListener('abort', onAbort, { once: true });
   }
   const timer = setTimeout(() => ctrl.abort(new Error(`超时（${timeout}ms）`)), timeout);
@@ -170,6 +191,11 @@ async function httpJson(url, { timeout = TIMEOUT, signal, headers } = {}) {
       throw err;
     }
     return await res.json();
+  } catch (err) {
+    // fetch 被 abort 时抛的是 AbortError，但我们要区分「用户中止」与「请求超时」：
+    // 前者必须原样冒泡上去让整轮更新停下，后者只是这一个源失败、可以换源重试。
+    if (signal?.aborted) throw abortError();
+    throw err;
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);
@@ -179,9 +205,11 @@ async function httpJson(url, { timeout = TIMEOUT, signal, headers } = {}) {
 /**
  * 带熔断的一次源请求。
  * @param {string} key 熔断/限流用的源标识（一般取 host）
- * @param {() => Promise<any>} fn
+ * @param {(signal?: AbortSignal) => Promise<any>} fn
+ * @param {AbortSignal} [signal]
  */
-async function fromSource(key, fn) {
+async function fromSource(key, fn, signal) {
+  if (signal?.aborted) throw abortError();
   const cooling = isDown(key);
   if (cooling) {
     const err = new Error(`${key} 暂不可用（${cooling}）`);
@@ -189,29 +217,14 @@ async function fromSource(key, fn) {
     throw err;
   }
   try {
-    const out = await withHostLock(key, fn);
+    const out = await withHostLock(key, () => fn(signal), signal);
     markOk(key);
     return out;
   } catch (err) {
-    if (!err?.skipped) markFail(key, err);
+    // 用户中止不算这个源的「失败」，别把它计进熔断
+    if (!err?.skipped && err?.name !== 'AbortError') markFail(key, err);
     throw err;
   }
-}
-
-/** 依次尝试多个源，返回第一个成功的结果；全部失败时抛出最后一个错误 */
-async function firstOk(sources) {
-  let lastErr = null;
-  for (const [key, fn] of sources) {
-    try {
-      const out = await fromSource(key, fn);
-      if (out !== undefined && out !== null) return out;
-      lastErr = new Error(`${key} 返回空数据`);
-      markFail(key, lastErr);
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr || new Error('所有行情源均不可用');
 }
 
 /* ============================================================ 币种符号解析 */
@@ -564,11 +577,12 @@ export async function fetchPrices(ids, symbolMap = {}, options = {}) {
   ];
 
   for (const [key, run] of sources) {
+    throwIfAborted(signal);
     const rest = pending();
     if (!rest.length) break;
     if (isDown(key)) continue;
     try {
-      const got = await fromSource(key, () => run(signal));
+      const got = await fromSource(key, () => run(signal), signal);
       for (const [id, q] of got) if (!out.has(id)) out.set(id, q);
       if (got.size === 0) markFail(key, new Error('该源没有这些币种'));
     } catch (err) {
@@ -648,9 +662,10 @@ export async function fetchUsdCny(options = {}) {
   ];
 
   for (const [key, run] of sources) {
+    throwIfAborted(signal);
     if (isDown(key)) continue;
     try {
-      const v = await fromSource(key, () => run(signal));
+      const v = await fromSource(key, () => run(signal), signal);
       const n = Number(v);
       if (Number.isFinite(n) && n > 0) {
         fxCache = { at: Date.now(), value: Number(n.toFixed(4)), source: key };
@@ -758,9 +773,10 @@ export async function priceHistory(coinId, fromDate, toDate, vsCurrency = 'cny',
   if (!pair.base) return [];
 
   for (const [key, run] of CANDLE_SOURCES) {
+    throwIfAborted(signal);
     if (isDown(key)) continue;
     try {
-      const candles = await fromSource(key, () => run(pair, spanDays + 5, signal));
+      const candles = await fromSource(key, () => run(pair, spanDays + 5, signal), signal);
       const picked = candles
         .filter((c) => c.date >= fromDate && c.date <= toDate)
         .sort((a, b) => a.date.localeCompare(b.date));

@@ -356,14 +356,39 @@ function countUp(el, target, { dur = 950, dp = 2 } = {}) {
 
 const PALETTE = ['#e8452c', '#c9a227', '#38a67b', '#ff7255', '#8d8478', '#b8842c', '#4ec296', '#a85f3c'];
 
+/**
+ * 迷你走势图。
+ *
+ * ⚠️ 两个坑都踩过：
+ *  1. 早先写的是 `span = max - min || 1`。当窗口内**所有值完全相等**
+ *     （停牌、当天净值还没出、刚加入还没走势）时，这个兜底会让
+ *     `(v - min) / span` 恒为 0，线被钉在盒子最底部（y = h-2），
+ *     视觉上像「掉到单元格下面去了」。现在这种情况直接画在中线。
+ *  2. 描边有宽度、路径又画满了 viewBox 的 x 方向，端点会各溢出半个线宽。
+ *     所以两端各留 1px 内缩（配合 CSS 去掉 overflow: visible），
+ *     走势图就老老实实待在自己的盒子里，不会压到相邻列。
+ */
 function sparkline(points, { w = 90, h = 26 } = {}) {
   const vals = (points || []).map((p) => Number(p.close ?? p.nav ?? p.price)).filter(Number.isFinite);
   if (vals.length < 3) return '<span class="dim mono" style="font-size:11px">数据不足</span>';
+
   const min = Math.min(...vals);
   const max = Math.max(...vals);
-  const span = max - min || 1;
-  const step = w / (vals.length - 1);
-  const d = vals.map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(2)},${(h - ((v - min) / span) * (h - 4) - 2).toFixed(2)}`).join(' ');
+  const span = max - min;
+  const padX = 1; // 让描边端点留在盒子内
+  const mid = h / 2;
+  const innerW = w - padX * 2;
+  const step = innerW / (vals.length - 1);
+
+  const d = vals
+    .map((v, i) => {
+      const x = padX + i * step;
+      // 全等值 → 居中一条水平线；否则按区间铺满（上下各留 2px 给描边）
+      const y = span === 0 ? mid : h - ((v - min) / span) * (h - 4) - 2;
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(' ');
+
   const rising = vals[vals.length - 1] >= vals[0];
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><path d="${d}" stroke="${rising ? '#ff7255' : '#4ec296'}" opacity=".9"/></svg>`;
 }
@@ -531,22 +556,24 @@ const COLUMNS = {
     { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
     { k: '持股' }, { k: '成本价' }, { k: '现价' }, { k: '今日盈亏' },
-    { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '自上次更新' },
-    { k: '走势' }, { k: '操作', cls: 'l' },
+    { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' },
+    // 「操作」列的表头不能加 .l（左对齐）：行里的按钮是贴右边缘的，
+    // 表头左对齐会与按钮差近 100px。让表头跟着按钮一起右对齐。
+    { k: '走势' }, { k: '操作' },
   ],
   fund: [
     { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
     { k: '持有份额' }, { k: '持仓均价' }, { k: '单位净值' }, { k: '当日盈亏' },
     { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '日定投' }, { k: '已定投' },
-    { k: '自上次更新' }, { k: '走势' }, { k: '操作', cls: 'l' },
+    { k: '走势' }, { k: '操作' },
   ],
   crypto: [
     { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
     { k: '数量' }, { k: '成本价' }, { k: '现价' }, { k: '24h 盈亏' },
-    { k: '市值 (¥)' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '自上次更新' },
-    { k: '操作', cls: 'l' },
+    { k: '市值 (¥)' }, { k: '浮动盈亏' }, { k: '收益率' },
+    { k: '操作' },
   ],
 };
 
@@ -592,7 +619,9 @@ function panelStats(key) {
     items.push(['成本 (USD)', `$${fmt.num(b.costNative, 2)}`]);
     items.push(['USD/CNY', rateStr]);
   } else {
-    items.push(['自上次更新', `<span class="${fmt.cls(b.sinceValueCny)}">${fmt.signed(b.sinceValueCny)}</span>`]);
+    // 「自上次更新」已从明细表移除，这里改成与「今日盈亏」列同一个口径的合计，
+    // 口径与总览的「今日」一致（缺失当日行情的标的按 0 计）
+    items.push(['今日盈亏', `<span class="${fmt.cls(b.dayValueCny)}">${fmt.signedMoney(b.dayValueCny, '¥')}</span>`]);
   }
   if (hiddenCount) {
     items.push([
@@ -682,7 +711,6 @@ function rowStock(r) {
     <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 3)}<br><span class="sub">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
     <td class="l">${rowActions(r)}</td>
   </tr>`;
@@ -708,7 +736,6 @@ function rowFund(r) {
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
     <td>${dcaNow}</td>
     <td>${r.dcaCount > 0 ? `${r.dcaCount} 笔<br><span class="sub dim">${fmt.money(r.dcaInvested)} · ${fmt.qty(r.dcaUnits)} 份</span>` : '<span class="dim">—</span>'}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 4)}<br><span class="sub">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
     <td class="l">${rowActions(r)}</td>
   </tr>`;
@@ -727,7 +754,6 @@ function rowCrypto(r) {
     <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlNative)}"><b>${fmt.signedMoney(r.pnlNative, cur)}</b><br><span class="sub dim">${fmt.signedMoney(r.pnl, '¥')}</span></td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${cur}${fmt.signed(r.sinceChange, 2)}<br><span class="sub">${fmt.pct(r.sinceChangePct)}</span></td>
     <td class="l">${rowActions(r)}</td>
   </tr>`;
 }
@@ -741,7 +767,7 @@ function renderTable(key) {
   const manual = sortState[key].by === 'manual';
   const prefix =
     key === 'stock'
-      ? '每行记录一只股票的持股与成本；「自上次更新」按上次更新时保存的价格计算变化。同一代码可以有多条，用「账户 / 备注」区分。'
+      ? '每行记录一只股票的持股与成本；「今日盈亏」＝ (现价 − 昨收) × 持股。同一代码可以有多条，用「账户 / 备注」区分。'
       : key === 'fund'
         ? '日定投在每次「更新净值」时，按 (上次定投日, 最新净值日] 之间每一个交易日的净值折算份额。'
         : '加密货币价格依次尝试 Binance → Gate.io → OKX → CoinGecko，成功的来源会标在标的下面；成本按「计价货币」计入。';
@@ -1711,15 +1737,28 @@ async function runUpdate(scope) {
   }
 }
 
-/** 中止更新：服务端只在加密货币这类可中断的源上立刻生效 */
+/**
+ * 中止更新。
+ *
+ * 服务端在每个标的开工前、以及每个源的循环里都会检查中止信号，
+ * 所以点下去之后**当前这一只**请求跑完就会停，不会把剩下的标的继续跑完。
+ * 拿到响应前先把按钮锁住并改文案，避免用户以为没反应而连点。
+ */
 async function cancelUpdate() {
   const btn = $('#busyCancel');
+  const label = $('#busyLabel');
+  const title = $('#busyTitle');
   if (btn) {
     btn.disabled = true;
     btn.textContent = '正在中止…';
   }
+  // 立刻在遮罩上给反馈：正在飞的这一个请求要跑完才会停
+  if (title) title.textContent = '正在中止更新';
+  if (label) label.textContent = '等待当前这一项请求结束…';
+  stopBusyPolling();
   try {
-    await api('/api/update/cancel', { method: 'POST' });
+    const res = await api('/api/update/cancel', { method: 'POST' });
+    if (label) label.textContent = res.cancelled ? '正在中止，稍候…' : '当前没有进行中的更新';
   } catch {
     /* 没赶上也无所谓，更新结束时遮罩会自己收起来 */
   } finally {
@@ -1728,7 +1767,9 @@ async function cancelUpdate() {
         btn.disabled = false;
         btn.textContent = '中止更新';
       }
-    }, 1500);
+      // 更新还在跑的话把进度轮询接回去，别让遮罩停在「正在中止」
+      if (!$('#busy').hidden) startBusyPolling('正在更新行情', '正在收尾…', { cancelable: true });
+    }, 2000);
   }
 }
 

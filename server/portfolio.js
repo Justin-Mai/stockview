@@ -472,30 +472,70 @@ export function countAssets(state, scope) {
 }
 
 /**
+ * 让一个**不可取消**的 Promise 变得可以提前放弃。
+ *
+ * stock-sdk / 行情源不接受 AbortSignal，所以正在飞的那个请求没法真的掐断
+ * （它会在后台自己跑完，结果被丢弃）。但「中止更新」没必要等它：
+ * 用 race 让调用方立刻得到 AbortError 返回，用户就不用盯着遮罩干等
+ * —— 实测行情源偶发重试时，单个请求能挂 10 秒以上。
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<T>}
+ */
+export function abortable(promise, signal) {
+  if (!signal) return promise;
+  crypto.throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(crypto.abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
  * 执行一次更新。
  * @param {object} state
  * @param {'stock'|'fund'|'crypto'} scope
  * @param {{onProgress?: (p:{label?:string, advance?:boolean}) => void, signal?: AbortSignal}} [options]
  *        onProgress 会在每只标的开始前报一次 label，完成后带 advance:true 报一次，供长任务进度条使用
- *        signal 用于「中止更新」：只在可中断的源（加密货币）上生效，命中时会抛 AbortError
+ *        signal 用于「中止更新」：三个板块都可中断 ——
+ *        每只标的开工前、以及每个行情源的循环里都会检查，命中时抛 AbortError，
+ *        调用方据此**不落盘、不推进 lastUpdate**。
  * @returns {Promise<{scope:string, summary:object, items:Array, errors:Array}>}
  */
 export async function runUpdate(state, scope, options = {}) {
   if (!SCOPES.includes(scope)) throw new Error(`未知板块 ${scope}`);
   const progress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
+  const signal = options.signal;
   const startedAt = nowStamp();
   const report = { scope, startedAt, finishedAt: null, summary: {}, items: [], errors: [] };
 
   // 同一代码可能有多条持仓（不同账户），行情/净值只抓一次，避免把更新时间乘以账户数
   const fetched = new Map();
   const once = async (key, fn) => {
-    if (!fetched.has(key)) fetched.set(key, await fn());
+    crypto.throwIfAborted(signal);
+    if (!fetched.has(key)) fetched.set(key, await abortable(fn(), signal));
     return fetched.get(key);
   };
 
-  if (scope === 'stock') await updateStocks(state, report, progress, once);
-  else if (scope === 'fund') await updateFunds(state, report, progress, once);
+  if (scope === 'stock') await updateStocks(state, report, progress, once, { signal });
+  else if (scope === 'fund') await updateFunds(state, report, progress, once, { signal });
   else await updateCryptos(state, report, progress, options);
+
+  // 中途被中止：**不推进** lastUpdate / quoteAt，也不写这条 update 流水 ——
+  // 下次更新仍以原来的基准计算，不会算漏一段行情。
+  crypto.throwIfAborted(signal);
 
   state.meta.lastUpdate[scope] = today();
   state.meta.quoteAt = nowStamp();
@@ -509,7 +549,8 @@ export async function runUpdate(state, scope, options = {}) {
 
 /* --------------------------------------------------------------- 股票 */
 
-async function updateStocks(state, report, progress = () => {}, once = async (_k, fn) => fn()) {
+async function updateStocks(state, report, progress = () => {}, once = async (_k, fn) => fn(), options = {}) {
+  const { signal } = options;
   const list = state.stocks;
   if (!list.length) {
     report.summary.message = '股票列表为空，没有需要更新的持仓';
@@ -520,6 +561,8 @@ async function updateStocks(state, report, progress = () => {}, once = async (_k
   let totalValue = 0;
 
   for (const stock of list) {
+    // 每只标的开工前先看一眼中止信号：否则点了「停止更新」也要把剩下的股票全部跑完
+    crypto.throwIfAborted(signal);
     // 屏蔽的标的不再打接口：既省一次请求，也不会因为「屏蔽项没有行情」而在界面上误导用户
     if (stock.hidden) {
       report.skipped = (report.skipped || 0) + 1;
@@ -583,6 +626,8 @@ async function updateStocks(state, report, progress = () => {}, once = async (_k
       totalValue += stock.quantity * stock.price;
       report.items.push(item);
     } catch (err) {
+      // 中止不是「这一只取价失败」：原样抛出去，让整轮更新立刻结束
+      if (err?.name === 'AbortError' || signal?.aborted) throw err;
       item.error = err.message || String(err);
       // 只有在该标的此前成功取过行情时才推进日期；
       // 否则（比如代码写错）保持 lastUpdate 为空，修好后首次更新仍会用「上一交易日」作基准
@@ -604,7 +649,8 @@ async function updateStocks(state, report, progress = () => {}, once = async (_k
 
 /* --------------------------------------------------------------- 基金 */
 
-async function updateFunds(state, report, progress = () => {}, once = async (_k, fn) => fn()) {
+async function updateFunds(state, report, progress = () => {}, once = async (_k, fn) => fn(), options = {}) {
+  const { signal } = options;
   const list = state.funds;
   if (!list.length) {
     report.summary.message = '基金列表为空，没有需要更新的持仓';
@@ -616,6 +662,8 @@ async function updateFunds(state, report, progress = () => {}, once = async (_k,
   let dcaApplied = 0;
 
   for (const fund of list) {
+    // 每只基金开工前先看中止信号（见 updateStocks 里的说明）
+    crypto.throwIfAborted(signal);
     // 屏蔽的基金：既不取净值，也不补算定投（份额与定投进度原地冻结）
     if (fund.hidden) {
       report.skipped = (report.skipped || 0) + 1;
@@ -743,6 +791,8 @@ async function updateFunds(state, report, progress = () => {}, once = async (_k,
       });
       report.items.push(item);
     } catch (err) {
+      // 中止不是「这一只取净值失败」：原样抛出去，让整轮更新立刻结束
+      if (err?.name === 'AbortError' || signal?.aborted) throw err;
       item.error = err.message || String(err);
       if (fund.navDate) fund.lastUpdate = today();
       report.items.push(item);
@@ -781,7 +831,7 @@ async function updateCryptos(state, report, progress = () => {}, options = {}) {
       state.meta.usdCnyAt = nowStamp();
     }
   } catch (err) {
-    if (err?.name === 'AbortError') throw err;
+    if (err?.name === 'AbortError' || signal?.aborted) throw err;
     /* 沿用旧汇率 */
   }
   const usdCny = num(state.meta.usdCny, null) || crypto.lastUsdCny() || 7.1;
@@ -797,6 +847,8 @@ async function updateCryptos(state, report, progress = () => {}, options = {}) {
   const failedSource = crypto.sourceStatus().filter((s) => s.cooling);
 
   for (const coin of list) {
+    // 每个币开工前先看中止信号（见 updateStocks 里的说明）
+    crypto.throwIfAborted(signal);
     // 屏蔽的币种不打接口
     if (coin.hidden) {
       report.skipped = (report.skipped || 0) + 1;
@@ -830,7 +882,7 @@ async function updateCryptos(state, report, progress = () => {}, options = {}) {
             coin.history = mergeHistory(coin.history, hist.map((h) => ({ date: h.date, price: h.price })));
           }
         } catch (err) {
-          if (err?.name === 'AbortError') throw err;
+          if (err?.name === 'AbortError' || signal?.aborted) throw err;
           /* 忽略：不影响现价更新 */
         }
       }
@@ -865,7 +917,7 @@ async function updateCryptos(state, report, progress = () => {}, options = {}) {
       report.items.push(item);
       progress({ label: `${coin.name}（${coin.symbol || coin.coinId}）${p.source} ✓`, advance: true });
     } catch (err) {
-      if (err?.name === 'AbortError') throw err;
+      if (err?.name === 'AbortError' || signal?.aborted) throw err;
       item.error = err.message || String(err);
       if (coin.baselinePrice) coin.lastUpdate = t;
       report.items.push(item);
@@ -914,9 +966,11 @@ function decorate(asset, scope, ctx) {
   const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;
   const avgCost = qty > 0 ? cost / qty : 0;
 
+  // 「自上次更新」：以更新时存下来的价格为基准算出的窗口涨跌。
+  // 明细表已经不再显示这一列（用户要求去掉），但总览的
+  // 「自上次更新（价格贡献）」还要用它的金额汇总，所以这里继续算。
   const baseline = num(asset.baselinePrice);
   const sinceChangeNative = baseline ? nativePrice - baseline : 0;
-  const sinceChangePct = baseline ? (sinceChangeNative / baseline) * 100 : 0;
   const sinceValueCny = qty * sinceChangeNative * rate;
 
   // 股票的「总成本 ≡ 数量 × 成本价」必须成立（界面没有单独的总成本输入）。
@@ -975,8 +1029,9 @@ function decorate(asset, scope, ctx) {
     dayValueNative,
     /** 同上，折算成人民币 —— 明细表「今日盈亏」列显示的就是这个数 */
     dayValueCny,
-    sinceChange: round(sinceChangeNative, 6),
-    sinceChangePct: round(sinceChangePct, 2),
+    // 说明：每单位的价格变动（sinceChange / sinceChangePct）曾经作为
+    // 「自上次更新」列输出，该列已被移除，所以不再往外暴露这两个字段。
+    // sinceValueCny 仍要给总览的「自上次更新（价格贡献）」汇总用，保留。
     sinceValueCny: round(sinceValueCny, 2),
   };
 }
