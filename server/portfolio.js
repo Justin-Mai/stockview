@@ -925,6 +925,32 @@ function decorate(asset, scope, ctx) {
   const costMismatch =
     scope === 'stock' && qty > 0 && num(asset.costPrice) > 0 && Math.abs(cost - expectedCost) > Math.max(1, expectedCost * 0.005);
 
+  /* ------------------------------ 当日涨跌 ------------------------------ */
+  // 二级市场当日涨跌（股票=当日涨跌幅，基金=净值日增长率，加密货币=24h 涨跌）。
+  // 这里算**两个层次**的数，因为它们在界面上回答的是不同问题：
+  //   ① 每单位涨跌了多少（价格口径）—— 百分比是现成的，绝对值按板块分别还原：
+  //      股票 —— 直接取「现价 − 昨收」，交易所给的真实值，不去反推百分比；
+  //      基金 —— 净值接口只给日增长率，没有昨收净值，按 nav × pct/(100+pct) 反推；
+  //      加密 —— 只有 24h 百分比，同样反推（金额是原币）。
+  //   ② 这些涨跌折算到**我的持仓**上是多少钱（持仓口径）—— 这才是用户真正关心的
+  //      「今天这一项让我赚/亏了多少」，也是明细表里显示的数值。
+  const dayChangePct = scope === 'stock' ? asset.changePercent : scope === 'fund' ? asset.dailyReturn : asset.change24h;
+  const pct = Number(dayChangePct);
+  const hasPct = Number.isFinite(pct);
+  let dayChange = null;
+  if (scope === 'stock') {
+    const prevClose = num(asset.prevClose, 0);
+    if (prevClose > 0 && price > 0) dayChange = price - prevClose;
+    else if (hasPct && price > 0) dayChange = price - price / (1 + pct / 100);
+  } else if (hasPct && nativePrice > 0 && pct > -100) {
+    dayChange = nativePrice - nativePrice / (1 + pct / 100);
+  }
+  // 基金净值 / 加密价格常常很小（0.5314 这种），2 位小数会把涨跌抹成 0.00，所以给到 6 位
+  const dayChangeValue = dayChange === null ? null : round(dayChange, 6);
+  // 持仓口径：每单位涨跌 × 数量，再按汇率折成人民币。没有当日行情的（停牌 / 净值未公布）为 null。
+  const dayValueNative = dayChangeValue === null ? null : round(qty * dayChangeValue, 6);
+  const dayValueCny = dayValueNative === null ? null : round(dayValueNative * rate, 2);
+
   return {
     ...asset,
     scope,
@@ -942,7 +968,13 @@ function decorate(asset, scope, ctx) {
     pnlPct: round(pnlPct, 2),
     priceDate: scope === 'stock' ? asset.priceDate : scope === 'fund' ? asset.navDate : asset.lastUpdate,
     /** 二级市场当日涨跌（股票=当日涨跌幅，基金=净值日增长率，加密货币=24h 涨跌） */
-    dayChangePct: scope === 'stock' ? asset.changePercent : scope === 'fund' ? asset.dailyReturn : asset.change24h,
+    dayChangePct: hasPct ? round(pct, 4) : null,
+    /** 每个单位当日涨跌了多少（股票/基金＝元，加密＝原币）；数据缺失时为 null */
+    dayChangeValue,
+    /** 当日涨跌折算到**我的持仓**上赚/亏了多少（原币）：每单位涨跌 × 数量 */
+    dayValueNative,
+    /** 同上，折算成人民币 —— 明细表「今日盈亏」列显示的就是这个数 */
+    dayValueCny,
     sinceChange: round(sinceChangeNative, 6),
     sinceChangePct: round(sinceChangePct, 2),
     sinceValueCny: round(sinceValueCny, 2),
@@ -953,12 +985,17 @@ function totalsOf(rows) {
   const marketValue = rows.reduce((s, r) => s + r.marketValue, 0);
   const cost = rows.reduce((s, r) => s + r.cost, 0);
   const sinceValueCny = rows.reduce((s, r) => s + r.sinceValueCny, 0);
+  // 当日涨跌贡献的持仓金额：没有当日行情的（停牌 / 净值未公布）按 0 计，不影响其它项
+  const dayValueCny = rows.reduce((s, r) => s + (Number(r.dayValueCny) || 0), 0);
   const pnl = marketValue - cost;
   return {
     marketValue: round(marketValue, 2),
     cost: round(cost, 2),
     pnl: round(pnl, 2),
     pnlPct: cost > 0 ? round((pnl / cost) * 100, 2) : 0,
+    /** 今日赚/亏了多少钱（按当日涨跌额 × 持仓） */
+    dayValueCny: round(dayValueCny, 2),
+    dayPct: marketValue - dayValueCny > 0 ? round((dayValueCny / (marketValue - dayValueCny)) * 100, 2) : 0,
     sinceValueCny: round(sinceValueCny, 2),
     sincePct: marketValue - sinceValueCny > 0 ? round((sinceValueCny / (marketValue - sinceValueCny)) * 100, 2) : 0,
     count: rows.length,

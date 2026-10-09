@@ -409,6 +409,14 @@ tbody tr.row-hidden .grip { cursor: not-allowed; }
 .dim { color: var(--paper-3); }
 .mono { font-family: var(--font-mono); }
 
+/*
+ * 单元格里的「第二行小字」——当日涨跌的百分比、市值的本币折算、净值日期等。
+ * 统一成一个类，而不是到处写 inline style="font-size:11px"：改字号只需改这一处。
+ * 颜色用 inherit，跟着外层单元格的涨跌色走；.dim 例外，用于纯说明性小字。
+ */
+tbody td .sub { display: inline-block; font-size: 11px; line-height: 1.35; opacity: .82; }
+tbody td .sub.dim { color: var(--paper-3); opacity: 1; }
+
 .badge {
   display: inline-block; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .04em;
   padding: 3px 7px; border-radius: 1px; border: 1px solid var(--line); color: var(--paper-3);

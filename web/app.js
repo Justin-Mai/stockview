@@ -55,10 +55,34 @@ const fmt = {
     const v = Number(n);
     return `${v > 0 && plus ? '+' : ''}${v.toFixed(dp)}%`;
   },
+  /**
+   * 当日盈亏单元格：数值在上、百分比在下。
+   * 数值 = 当日涨跌 × 持仓（即「这一项今天让我赚/亏了多少钱」），
+   * 不是每单位的价格变动 —— 价格变动看「现价」列即可。
+   */
+  dayMove(value, pct, { symbol = '¥', dp = 2, dpPct = 2, title = '' } = {}) {
+    const hasPct = pct !== null && pct !== undefined && !Number.isNaN(Number(pct));
+    const pctLine = hasPct ? `<br><span class="sub">${fmt.pct(pct, dpPct)}</span>` : '';
+    const tip = title ? ` title="${esc(title)}"` : '';
+    // 没有当日行情（停牌 / 净值未公布）：百分比那行也留空，避免表格高度跳动
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+      return `<span class="dim"${tip}>—</span>${pctLine}`;
+    }
+    // 持仓口径的金额一定是「钱」，两端对齐到分即可：既不抹零也不拖尾
+    const v = Number(value);
+    const sign = v > 0 ? '+' : v < 0 ? '-' : '';
+    const text = Math.abs(v).toLocaleString('zh-CN', nf(dp));
+    return `<b${tip}>${sign}${symbol}${text}</b>${pctLine}`;
+  },
   signed(n, dp = 2) {
     if (n === null || n === undefined) return '—';
     const v = Number(n);
     return `${v > 0 ? '+' : ''}${v.toLocaleString('zh-CN', nf(dp))}`;
+  },
+  /** 固定小数位的带符号数（用于 tooltip 里说明口径，精度要够小值也看得见） */
+  exactSigned(n, dp = 4) {
+    if (n === null || n === undefined || !Number.isFinite(Number(n))) return '—';
+    return fmt.signed(n, dp);
   },
   /** 带符号与货币符号：+$64.98 / -¥1,234.00 */
   signedMoney(n, symbol, dp = 2) {
@@ -450,6 +474,7 @@ function renderOverview() {
         <div class="hero-value"><span class="cur">¥</span><span id="heroInt">0</span><span class="cents" id="heroDec">.00</span></div>
         <div class="hero-sub">
           <div class="stat"><span>总成本</span><b>${fmt.money(t.cost)}</b></div>
+          <div class="stat"><span>今日</span><b class="${fmt.cls(t.dayValueCny)}">${fmt.signedMoney(t.dayValueCny, '¥')}</b><small class="${fmt.cls(t.dayPct)}">${fmt.pct(t.dayPct)}</small></div>
           <div class="stat"><span>累计盈亏</span><b class="${fmt.cls(t.pnl)}">${fmt.signed(t.pnl)}</b><small class="${fmt.cls(t.pnl)}">${fmt.pct(t.pnlPct)}</small></div>
           <div class="stat"><span>持仓标的</span><b>${t.count}</b></div>
           ${hiddenTotal ? `<div class="stat"><span>已屏蔽</span><b class="dim">${hiddenTotal}</b><small class="dim">不计入上方合计</small></div>` : ''}
@@ -505,21 +530,21 @@ const COLUMNS = {
   stock: [
     { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
-    { k: '持股' }, { k: '成本价' }, { k: '现价' }, { k: '今日涨跌' },
+    { k: '持股' }, { k: '成本价' }, { k: '现价' }, { k: '今日盈亏' },
     { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '自上次更新' },
     { k: '走势' }, { k: '操作', cls: 'l' },
   ],
   fund: [
     { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
-    { k: '持有份额' }, { k: '持仓均价' }, { k: '单位净值' }, { k: '日涨跌' },
+    { k: '持有份额' }, { k: '持仓均价' }, { k: '单位净值' }, { k: '当日盈亏' },
     { k: '市值' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '日定投' }, { k: '已定投' },
     { k: '自上次更新' }, { k: '走势' }, { k: '操作', cls: 'l' },
   ],
   crypto: [
     { k: '', cls: 'drag-col' },
     { k: '标的', cls: 'l' },
-    { k: '数量' }, { k: '成本价' }, { k: '现价' }, { k: '24h' },
+    { k: '数量' }, { k: '成本价' }, { k: '现价' }, { k: '24h 盈亏' },
     { k: '市值 (¥)' }, { k: '浮动盈亏' }, { k: '收益率' }, { k: '自上次更新' },
     { k: '操作', cls: 'l' },
   ],
@@ -653,11 +678,11 @@ function rowStock(r) {
     <td>${fmt.qty(r.quantity)}</td>
     <td>${fmt.price(r.avgCost, dp)}${flag}</td>
     <td class="${dimIfHidden(r)}"><b>${fmt.price(r.price, dp)}</b></td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayValueCny)}" title="今日盈亏 = (现价 − 昨收) × 持股">${fmt.dayMove(r.dayValueCny, r.dayChangePct, { title: `每股价 ${fmt.exactSigned(r.dayChangeValue, 4)} 元 × ${fmt.qty(r.quantity)} 股` })}</td>
     <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 3)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 3)}<br><span class="sub">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
     <td class="l">${rowActions(r)}</td>
   </tr>`;
@@ -676,14 +701,14 @@ function rowFund(r) {
     <td class="l">${whoCell(r, `${esc(r.code)}${dcaOn && r.lastDcaDate ? ` · 上次定投 ${esc(r.lastDcaDate)}` : ''}`)}</td>
     <td>${fmt.qty(r.quantity)}</td>
     <td>${fmt.cost(r.avgCost)}</td>
-    <td class="${dimIfHidden(r)}"><b>${fmt.price(r.nav)}</b><br><span style="font-size:11px" class="dim">${esc(fmt.date(r.navDate))}</span></td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
+    <td class="${dimIfHidden(r)}"><b>${fmt.price(r.nav)}</b><br><span class="sub dim">${esc(fmt.date(r.navDate))}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayValueCny)}" title="当日盈亏 = 每份净值涨跌 × 持有份额">${fmt.dayMove(r.dayValueCny, r.dayChangePct, { title: `每份净值涨跌 ${fmt.exactSigned(r.dayChangeValue, 4)} 元 × ${fmt.qty(r.quantity)} 份` })}</td>
     <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnl)}">${fmt.signedMoney(r.pnl, '¥')}</td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
     <td>${dcaNow}</td>
-    <td>${r.dcaCount > 0 ? `${r.dcaCount} 笔<br><span style="font-size:11px" class="dim">${fmt.money(r.dcaInvested)} · ${fmt.qty(r.dcaUnits)} 份</span>` : '<span class="dim">—</span>'}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 4)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
+    <td>${r.dcaCount > 0 ? `${r.dcaCount} 笔<br><span class="sub dim">${fmt.money(r.dcaInvested)} · ${fmt.qty(r.dcaUnits)} 份</span>` : '<span class="dim">—</span>'}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${fmt.signed(r.sinceChange, 4)}<br><span class="sub">${fmt.pct(r.sinceChangePct)}</span></td>
     <td>${sparkline(r.history)}</td>
     <td class="l">${rowActions(r)}</td>
   </tr>`;
@@ -697,12 +722,12 @@ function rowCrypto(r) {
     <td class="l">${whoCell(r, `${esc(r.symbol)} · ${esc(r.coinId)}${src ? ` · <i class="flag">${esc(src)}</i>` : ''}`)}</td>
     <td>${fmt.cryptoQty(r.quantity)}</td>
     <td>${cur}${fmt.price(r.costPrice, 2)}</td>
-    <td class="${dimIfHidden(r)}"><b>${cur}${fmt.price(r.nativePrice, 2)}</b>${r.currency === 'USD' && r.priceCny ? `<br><span style="font-size:11px" class="dim">¥${fmt.price(r.priceCny, 2)}</span>` : ''}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayChangePct)}">${fmt.pct(r.dayChangePct)}</td>
+    <td class="${dimIfHidden(r)}"><b>${cur}${fmt.price(r.nativePrice, 2)}</b>${r.currency === 'USD' && r.priceCny ? `<br><span class="sub dim">¥${fmt.price(r.priceCny, 2)}</span>` : ''}</td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.dayValueCny)}" title="24h 盈亏（换算成人民币）">${fmt.dayMove(r.dayValueCny, r.dayChangePct, { title: `每枚 ${cur}${fmt.exactSigned(r.dayChangeValue, 6)} × ${fmt.cryptoQty(r.quantity)} 枚，按汇率折人民币` })}</td>
     <td class="${dimIfHidden(r)}">${fmt.money(r.marketValue)}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlNative)}"><b>${fmt.signedMoney(r.pnlNative, cur)}</b><br><span style="font-size:11px" class="dim">${fmt.signedMoney(r.pnl, '¥')}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlNative)}"><b>${fmt.signedMoney(r.pnlNative, cur)}</b><br><span class="sub dim">${fmt.signedMoney(r.pnl, '¥')}</span></td>
     <td class="${r.hidden ? 'dim' : fmt.cls(r.pnlPct)}">${fmt.pct(r.pnlPct)}</td>
-    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${cur}${fmt.signed(r.sinceChange, 2)}<br><span style="font-size:11px">${fmt.pct(r.sinceChangePct)}</span></td>
+    <td class="${r.hidden ? 'dim' : fmt.cls(r.sinceChange)}">${cur}${fmt.signed(r.sinceChange, 2)}<br><span class="sub">${fmt.pct(r.sinceChangePct)}</span></td>
     <td class="l">${rowActions(r)}</td>
   </tr>`;
 }
