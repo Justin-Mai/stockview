@@ -218,8 +218,9 @@ function visibleRows(scope) {
 /**
  * 合计永远只算「未屏蔽」的部分 —— 屏蔽的语义就是「这项先不算」。
  *
- * 这里刻意不提供「含屏蔽项」的口径：屏蔽时行情字段会被清空，
- * 把这样一行算进合计只会得到「市值 0、亏损 100%」的假数字。
+ * 屏蔽项自身照常更新行情（价格不冻结），所以这里不提供「含屏蔽项」的主口径
+ * 只是为了让读数与「屏蔽后剩下的组合」保持一致；
+ * 被排除掉多少另有 byScopeRaw 提供，在屏蔽条上单独说明。
  */
 function totalsFor() {
   return S.computed.totals;
@@ -643,7 +644,7 @@ function hiddenBar(key) {
   const count = c.hiddenCount?.[key] || 0;
   const showing = showHidden[key];
   const scopeTotals = c.byScope[key];
-  // 被屏蔽项自己的合计（行情冻在屏蔽那一刻），用于说明「排除掉了多少」
+  // 被屏蔽项自己的合计（行情照常更新），用于说明「排除掉了多少」
   const raw = c.byScopeRaw?.[key] || scopeTotals;
 
   if (!count) {
@@ -661,7 +662,7 @@ function hiddenBar(key) {
       <b>${count} 项已屏蔽${showing ? '（下方列出，仍不计入合计）' : ''}</b>
       <span>整体内容（不含屏蔽项）：市值 <b>${fmt.money(scopeTotals.marketValue)}</b> · 成本 <b>${fmt.money(scopeTotals.cost)}</b> · 盈亏 <b class="${fmt.cls(scopeTotals.pnl)}">${fmt.signedMoney(scopeTotals.pnl, '¥')}</b>（${fmt.pct(scopeTotals.pnlPct)}）
       · 已排除 <b>${fmt.money(excludedValue)}</b>（成本 ${fmt.money(raw.cost - scopeTotals.cost)}）
-      <br><span class="dim">屏蔽不会删数据：持仓、成本、行情都原样留着，只是暂不计入合计；点「取消屏蔽」立刻还原。</span></span>
+      <br><span class="dim">屏蔽只影响合计：行情照常更新（含基金定投），记录与成本原样保留；点「取消屏蔽」立刻还原。</span></span>
     </div>
     <button class="btn-ghost hb-btn" data-togglehidden="${key}">${showing ? '收起屏蔽项' : '显示屏蔽项'}</button>
   </div>`;
@@ -678,9 +679,9 @@ function whoCell(r, code) {
 /**
  * 屏蔽行**照常显示真实数字**，只是整行压暗并标注「已屏蔽」。
  *
- * 数据并没有被丢掉：屏蔽期间行情只是"冻住"（更新行情会跳过它），
- * 所以这里显示的是屏蔽那一刻的价格 / 成本 / 盈亏 —— 你能一眼看出这一项现在值多少，
- * 只是它没算进合计。取消屏蔽后数字原样回到合计里，不需要重新拉行情。
+ * 数据并没有被丢掉：屏蔽只影响「算不算进合计」，**行情照常更新**
+ * （价格、走势、基金定投都跟着走）—— 所以这里显示的就是这一项的最新数字，
+ * 只是它没算进合计。取消屏蔽后数字原样回到合计里。
  *
  * 早期版本把这些单元格换成「—」，看起来像数据被删了；用户的反馈是
  * 「屏蔽了之后把成本价搞没了」。
@@ -722,8 +723,7 @@ function rowFund(r) {
     ? `<span class="badge on">¥${fmt.num(r.dca.amount, 0)}/日</span>`
     : '<span class="badge">未开启</span>';
   const pending = r.pendingDays > 0 ? `<span class="badge wait">待 ${r.pendingDays} 日</span>` : '';
-  // 屏蔽期间不补算定投，所以这里标注「定投暂停」而不是假装已同步
-  const dcaNow = r.hidden ? `${dcaCell}<br><span class="badge">定投暂停</span>` : `${dcaCell}<br>${pending}`;
+  const dcaNow = `${dcaCell}<br>${pending}`;
   return `<tr data-id="${esc(r.id)}">
     ${GRIP}
     <td class="l">${whoCell(r, `${esc(r.code)}${dcaOn && r.lastDcaDate ? ` · 上次定投 ${esc(r.lastDcaDate)}` : ''}`)}</td>
@@ -783,7 +783,7 @@ function renderTable(key) {
     : '';
 
   const hint = hiddenRows.length && !showHidden[key]
-    ? `另有 <b>${hiddenRows.length}</b> 项已屏蔽（不计入合计，<b>数据都还在</b>），点上方「显示屏蔽项」查看。`
+    ? `另有 <b>${hiddenRows.length}</b> 项已屏蔽（不计入合计，<b>行情照常更新</b>），点上方「显示屏蔽项」查看。`
     : manual
       ? '当前为自定义顺序，<b>按住行首的 ⠿ 可拖动调整</b>。'
       : '当前为排序视图，切回「自定义」才能拖动。';
@@ -1152,7 +1152,8 @@ function toggleHiddenView(scope) {
 
 /**
  * 屏蔽 / 取消屏蔽一项资产。
- * 屏蔽后该行仍然留着（可在「显示屏蔽项」里看到并恢复），但行情被冻结、不计入任何合计。
+ * 屏蔽后该行仍然留着（可在「显示屏蔽项」里看到并恢复），只是不计入任何合计；
+ * **行情照常更新**，所以这里没有"冻住"的问题。
  */
 async function toggleHidden(scope, id, hide) {
   const asset = rowsOfScope(scope).find((x) => x.id === id);
@@ -1162,8 +1163,8 @@ async function toggleHidden(scope, id, hide) {
       `屏蔽「${asset.name}」？\n\n` +
         `· 它不再计入总市值 / 成本 / 盈亏 / 权重等任何合计；\n` +
         `· 记录、持仓、成本、行情**原样保留**，不会丢任何数据；\n` +
-        `· 更新行情时会跳过它（不取价、不补定投），行情就停在现在这一刻；\n` +
-        `· 随时点「取消屏蔽」立刻还原，不需要重新拉行情。`,
+        `· 行情**照常更新**（价格、走势、基金定投都继续算），只是数字不进合计；\n` +
+        `· 随时点「取消屏蔽」立刻还原。`,
     );
     if (!ok) return;
   }
@@ -1329,7 +1330,7 @@ function openDrawer(scope, id = null) {
   html += `<div class="field" style="border-top:1px solid var(--line);padding-top:20px">
     <label>屏蔽这一项</label>
     <label class="switch"><input type="checkbox" name="hidden" ${asset?.hidden ? 'checked' : ''}/><span class="track"></span><b>${asset?.hidden ? '已屏蔽，不计入合计' : '正常计入合计'}</b></label>
-    <span class="hint">屏蔽后：账页里仍保留这条记录，<b>持仓 / 成本 / 行情原样保留</b>，只是不再计入总市值、成本、盈亏、权重；更新行情时会跳过它（行情停在屏蔽那一刻）。随时关掉这个开关就立刻还原，<b>不需要重新拉行情</b>。</span>
+    <span class="hint">屏蔽后：账页里仍保留这条记录，<b>持仓 / 成本 / 行情原样保留</b>，只是不再计入总市值、成本、盈亏、权重。注意<b>行情照常更新</b>（基金定投也照常补算），所以取消屏蔽时看到的就是当时的最新数字。随时关掉这个开关就立刻还原。</span>
   </div>`;
 
   html += `<div class="preview" id="preview"><div class="pr"><span>参考行情</span><b>填写代码后自动获取</b></div></div>`;
@@ -1496,7 +1497,7 @@ function updatePreview(scope, asset) {
   const codeSwitched = Boolean(asset && codeNow && codeNow !== originalCode);
 
   if (asset?.hidden) {
-    rows.push(['当前状态', '已屏蔽 · 不计入合计（持仓与行情原样保留）']);
+    rows.push(['当前状态', '已屏蔽 · 不计入合计（行情照常更新，记录与成本保留）']);
   }
 
   if (asset?.costMismatch) {
@@ -1701,7 +1702,7 @@ async function runUpdate(scope) {
         lines.push(
           `成功 ${rep.summary.updated} 项` +
             (rep.summary.failed ? ` · 失败 ${rep.summary.failed} 项` : '') +
-            (rep.summary.skipped ? ` · 已屏蔽跳过 ${rep.summary.skipped} 项` : ''),
+            (rep.summary.hidden ? ` · 其中屏蔽 ${rep.summary.hidden} 项（已更新，不计入合计）` : ''),
         );
       }
       if (rep.summary?.totalChange !== undefined) {

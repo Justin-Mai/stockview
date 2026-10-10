@@ -341,15 +341,16 @@ export function reorderAssets(state, scope, ids = []) {
 /**
  * 屏蔽 = 「这一项暂时不计入任何合计」，**不是**删除、也不是清空数据。
  *
- * 所以这里刻意**不动任何行情字段**：
+ * 关键：屏蔽只改「算不算进合计」，不改「更不更新」——
  *  - 成本价 / 数量 / 总成本 / 备注 / 定投配置全部原样保留；
- *  - 上次取到的行情价也一并留着，界面上照样显示（标注成「已屏蔽」），
- *    这样你一眼能看出这一项现在值多少，只是没算进合计；
- *  - 更新行情时会跳过它（不取价、不补定投），行情就停在屏蔽那一刻；
- *  - 取消屏蔽 = 把 hidden 一放回 false，**所有数字立刻回到屏蔽前的样子**，
- *    不需要重新拉一次行情。
+ *  - 行情**照常更新**：价格、走势、上次更新日都会跟着走，基金的定投也照常补算。
+ *    （早期版本屏蔽后会跳过更新，取消屏蔽时看到的是屏蔽那天的旧价，
+ *     还得手动补一次；现在屏蔽项与普通项走完全相同的更新流程。）
+ *  - 界面上照样显示真实数字（标注成「已屏蔽」），这样你一眼能看出这一项现在值多少，
+ *    只是它没算进合计；
+ *  - 取消屏蔽 = 把 hidden 放回 false，**所有数字立刻回到组合里**，不需要再做别的。
  *
- * ⚠️ 早期版本在屏蔽时把这些行情字段清成 null，结果取消屏蔽后成本价 /
+ * ⚠️ 更早的版本在屏蔽时把这些行情字段清成 null，结果取消屏蔽后成本价 /
  * 均价都变成 0，必须再点一次「更新行情」才能找回来 —— 用户的反馈是
  * 「屏蔽了之后把成本价搞没了」。屏蔽不该有任何破坏性。
  */
@@ -359,7 +360,7 @@ const QUOTE_FIELDS = {
   crypto: ['price', 'priceCny', 'priceUsd', 'change24h', 'priceSource', 'baselinePrice', 'baselineDate', 'lastUpdate', 'history'],
 };
 
-/** 该标的当前是否「有行情」——只用于屏蔽时提示「行情停在某天」 */
+/** 该标的当前是否「有行情」——仅用于日志里说明「带着哪一天的行情进入屏蔽」 */
 const QUOTE_PROBE = {
   stock: ['price'],
   fund: ['nav'],
@@ -383,7 +384,7 @@ export function setAssetHidden(state, scope, id, hidden) {
   const next = hidden !== false;
   if (Boolean(asset.hidden) === next) return asset;
 
-  const frozen = next && hasQuote(scope, asset) ? (asset.lastUpdate || null) : null;
+  const quoteDate = next && hasQuote(scope, asset) ? asset.lastUpdate || null : null;
   asset.hidden = next;
   // 这里**没有**任何字段被清空 —— 详见上面 QUOTE_FIELDS 处的说明
   asset.updatedAt = nowStamp();
@@ -392,8 +393,9 @@ export function setAssetHidden(state, scope, id, hidden) {
     kind: 'edit',
     assetId: asset.id,
     text: next
-      ? `屏蔽 ${asset.name}${asset.code ? `(${asset.code})` : ''}：不再计入合计，持仓与行情原样冻结${frozen ? `（行情停在 ${frozen}）` : ''}`
-      : `取消屏蔽 ${asset.name}${asset.code ? `(${asset.code})` : ''}：已恢复计入合计，持仓与行情原样还原`,
+      ? `屏蔽 ${asset.name}${asset.code ? `(${asset.code})` : ''}：不再计入合计，记录与行情原样保留` +
+        `${quoteDate ? `（当前行情 ${quoteDate}，之后照常更新）` : ''}`
+      : `取消屏蔽 ${asset.name}${asset.code ? `(${asset.code})` : ''}：已恢复计入合计`,
   });
   return asset;
 }
@@ -543,7 +545,7 @@ export async function runUpdate(state, scope, options = {}) {
   report.summary.label = SCOPE_LABEL[scope];
   report.summary.updated = report.items.filter((x) => !x.error).length;
   report.summary.failed = report.errors.length;
-  report.summary.skipped = report.skipped || 0;
+  report.summary.hidden = report.hiddenCount || 0;
   return report;
 }
 
@@ -563,12 +565,9 @@ async function updateStocks(state, report, progress = () => {}, once = async (_k
   for (const stock of list) {
     // 每只标的开工前先看一眼中止信号：否则点了「停止更新」也要把剩下的股票全部跑完
     crypto.throwIfAborted(signal);
-    // 屏蔽的标的不再打接口：既省一次请求，也不会因为「屏蔽项没有行情」而在界面上误导用户
-    if (stock.hidden) {
-      report.skipped = (report.skipped || 0) + 1;
-      progress({ advance: true });
-      continue;
-    }
+    // 屏蔽的标的**照常更新**：屏蔽只影响合计口径，不影响是否取价。
+    // 这里只额外记一笔，供界面提示「其中 N 项已屏蔽」。
+    if (stock.hidden) report.hiddenCount = (report.hiddenCount || 0) + 1;
     const item = { id: stock.id, code: stock.code, name: stock.name };
     progress({ label: `正在获取 ${stock.name}（${stock.code}）日线…` });
     try {
@@ -664,12 +663,8 @@ async function updateFunds(state, report, progress = () => {}, once = async (_k,
   for (const fund of list) {
     // 每只基金开工前先看中止信号（见 updateStocks 里的说明）
     crypto.throwIfAborted(signal);
-    // 屏蔽的基金：既不取净值，也不补算定投（份额与定投进度原地冻结）
-    if (fund.hidden) {
-      report.skipped = (report.skipped || 0) + 1;
-      progress({ advance: true });
-      continue;
-    }
+    // 屏蔽的基金**照常取净值、照常补算定投**（屏蔽只影响合计口径）
+    if (fund.hidden) report.hiddenCount = (report.hiddenCount || 0) + 1;
     const item = { id: fund.id, code: fund.code, name: fund.name };
     progress({ label: `正在获取 ${fund.name}（${fund.code}）历史净值…` });
     try {
@@ -849,12 +844,8 @@ async function updateCryptos(state, report, progress = () => {}, options = {}) {
   for (const coin of list) {
     // 每个币开工前先看中止信号（见 updateStocks 里的说明）
     crypto.throwIfAborted(signal);
-    // 屏蔽的币种不打接口
-    if (coin.hidden) {
-      report.skipped = (report.skipped || 0) + 1;
-      progress({ advance: true });
-      continue;
-    }
+    // 屏蔽的币种**照常取价**（屏蔽只影响合计口径）
+    if (coin.hidden) report.hiddenCount = (report.hiddenCount || 0) + 1;
     const item = { id: coin.id, coinId: coin.coinId, name: coin.name, symbol: coin.symbol };
     try {
       const p = prices.get(coin.coinId);
@@ -1075,12 +1066,10 @@ export async function computeState(state) {
   const allCryptos = state.crypto.map((a) => decorate(a, 'crypto', ctx));
 
   // 定投待执行交易日（今天仍未执行的天数）—— 屏蔽的基金不参与，也不显示待办
+  // 定投待执行交易日（今天仍未执行的天数）。屏蔽的基金现在也照常补算定投，
+  // 所以它自己也显示真实待办；而合计（dca.pendingDays）只累加 visible 的行，天然排除屏蔽项。
   const t = today();
   for (const f of allFunds) {
-    if (f.hidden) {
-      f.pendingDays = 0;
-      continue;
-    }
     if (f.dca?.enabled && num(f.dca.amount) > 0) {
       const anchor = f.lastDcaDate || addDays(f.dca.startDate || t, -1);
       const all = await cn.tradingDaysBetween(anchor, t);
@@ -1118,7 +1107,7 @@ export async function computeState(state) {
   // 只有一套口径：屏蔽项不计入。accounting 上「屏蔽」就等于把它移出组合，
   // 但记录与行情都留在盘里可以随时还原 —— 所以不需要第二套「含屏蔽项」的合计。
   const visible = aggregate((r) => !r.hidden);
-  // 屏蔽项自己的合计（行情冻在屏蔽那一刻），只用于说明「排除掉了多少」，不参与任何主口径
+  // 屏蔽项自己的合计（行情照常更新，取的就是最新数），只用于说明「排除掉了多少」，不参与任何主口径
   const raw = aggregate(() => true);
   const hiddenRows = {
     stock: allStocks.filter((r) => r.hidden),
@@ -1179,7 +1168,7 @@ export async function computeState(state) {
       usdCnyAt: state.meta.usdCnyAt,
       totals,
       byScope,
-      /** 「含屏蔽项」的合计（屏蔽项行情冻在屏蔽那一刻）——只用来算「已排除多少」 */
+      /** 「含屏蔽项」的合计（屏蔽项行情照常更新）——只用来算「已排除多少」 */
       byScopeRaw: raw.byScope,
       allocation,
       dca,
